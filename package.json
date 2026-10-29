@@ -29,6 +29,7 @@
     "dist",
     "schema",
     "docs/*.md",
+    "docs/assets/*.svg",
     "README.md",
     "LICENSE"
   ],

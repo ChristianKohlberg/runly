@@ -14,6 +14,8 @@ can build, test and demonstrate their changes independently.
 Idle services stop and wake when needed, while temporary public previews expire.
 More parallel work. Less interference. Less cleanup.
 
+![Runly gives each worktree a stable URL and unique port. Idle app services sleep while their data stays; proxy traffic wakes them.](docs/assets/runly-worktrees.svg)
+
 ## Quickstart
 
 Requires Node ≥ 22.13 and git, on Linux or macOS. Install from npm:
