@@ -101,8 +101,8 @@ eval "$(runly ctx --env)" && npm test
 
 Exports include `RUNLY_ENV_ID`, `RUNLY_URL_<SERVICE>`, `RUNLY_PORT_<PORT>` and
 `RUNLY_DATASTORE_<NAME>_URL`. Names become uppercase with punctuation replaced by
-underscores. `db with` instead supplies `RUNLY_DB_URL`, `RUNLY_DB_DATABASE` and
-`RUNLY_DB_COPY`. Runly returns the test command's exit code.
+underscores. `db with` instead supplies `RUNLY_DB_URL`, `RUNLY_DB_DATABASE`,
+`RUNLY_DB_PRESET` and `RUNLY_DB_COPY`. Runly returns the test command's exit code.
 
 `ctx` is read-only; `exec` resumes eligible services and heartbeats while its
 command runs. Source edits are visible immediately to processes in the worktree;

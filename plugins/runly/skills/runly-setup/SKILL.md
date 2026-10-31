@@ -109,7 +109,7 @@ upkeep:
 Pass {{datastores.main.url}} to the app's database setting. Verify seeds create
 realistic test data and advertised users.
 
-For postgres, mysql, mssql or redis, use an existing backing server with probe,
+For postgres, mysql, mssql, redis, mongodb or elasticsearch, use an existing backing server with probe,
 url, namespace-aware create/drop, and template_restore where required. Commands
 receive {{ns}}: never hardcode a shared database that reset or cleanup could drop.
 Server copies need a working drop recipe. runly does not provide database servers;
@@ -126,6 +126,16 @@ datastore; ordinary up retains data.
 copies_only: true provisions a datastore only through db new/with; services
 cannot reference it and ctx omits it. ephemeral: true is for stores without
 presets/templates whose reset uses drop as a flush.
+
+mongodb and elasticsearch namespaces are lowercase and usually end in a hash:
+always take them from {{ns}} / {{datastores.<ds>.ns}}. elasticsearch must be
+ephemeral: true; its {{ns}} is an index-name prefix — name indices {{ns}}-<name>
+or {{ns}}.<name> and delete them by name in drop:. Add derived_from: <source> so
+the index is flushed whenever its source datastore is restored or reloaded.
+Services can read {{datastores.<ds>.preset}} (the preset the store holds) and
+{{env.id}} / {{env.slug}} (lowercase). An upkeep when: may name data outside the
+worktree; commit it as {{main_worktree}}/../<repo>/<path>/** so every linked
+worktree resolves the same files.
 
 ## Caller inputs, authentication and previews
 

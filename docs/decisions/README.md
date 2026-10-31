@@ -1,7 +1,7 @@
 # Decision log
 
 This is design history, not an operating guide. Start with the [current guide](../overview.md).
-Current lifecycle, preview, manifest and monitoring contracts are in **0046–0049**.
+Current lifecycle, preview, manifest and monitoring contracts are in **0046–0049**; the mongodb/elasticsearch drivers, derived datastores and external upkeep triggers in **0050**.
 
 Decisions, MADR-lite, append-only. To change a decision, add a new one that amends
 or supersedes it, point the old one's `Status:` line at it, and update this index —
@@ -59,3 +59,4 @@ each one; the decision's own `Status:` line says how.
 | [0047](0047-public-preview-deadlines.md) | Mandatory public-preview deadlines, expiry gate, renewal and reopening | Accepted |
 | [0048](0048-manifest-names-and-skills.md) | runly.yml/runly.yaml discovery and separate operation/setup skills | Accepted |
 | [0049](0049-local-statistics-and-monitor.md) | Bounded local statistics and read-only monitoring | Accepted |
+| [0050](0050-mongodb-elasticsearch-derived-datastores.md) | `mongodb` and `elasticsearch` command drivers with lowercase, hash-disambiguated namespaces; Elasticsearch is ephemeral derived state, flushed with its `derived_from` source; `{{datastores.<ds>.preset}}`, `{{env.id}}`, `{{env.slug}}`; upkeep `when:` may reach outside the worktree (`{{main_worktree}}`, bounded walk) | Accepted |

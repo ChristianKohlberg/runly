@@ -387,3 +387,10 @@ See tests/metrics*.test.ts, proxy-metrics, proxy-metric-context and datastore-me
 
 - A SQLite template's final path is its success marker. Seed or adopt into a unique pending file, checkpoint any WAL/journal sidecars after seeding, and rename only after successful creation or copying. Failed or killed seeds must never publish a partial template. Retention must exclude pending files and sidecars from current-template ranking, then reclaim them after grace. `tests/datastore-drivers.test.ts` covers failed seeds, SIGKILL and committed WAL data.
 - Monitor output must obey stdout backpressure and remain cancellable while a consumer is not reading. Polling is sequential; timeout/signals also cancel a pending write. `tests/metrics-stress.test.ts` exercises actual unread subprocess pipes. Persisted metric buckets must satisfy histogram/count/range invariants before loading; cap eviction must not scan the whole history per observation.
+
+## MongoDB/Elasticsearch, derived datastores, external triggers (decision 0050)
+
+- `mongodb`/`elasticsearch` are `CommandDs` drivers; `CASE_FOLDING_DRIVERS` makes their env AND template namespaces lowercase via `serverNamespace` (hash of the original appended when folding changed it). Never lowercase other drivers' names: existing namespaces and drop recipes would move. Doctor compares folded names case-insensitively and reduces Elasticsearch `list:` lines to `<ns>` before `-`/`.`; a name under a referenced prefix is never an orphan.
+- `derived_from` is engine policy (`withDerived` on the incremental reload, `restoring(source)` on the full path), not driver policy. Elasticsearch must be `ephemeral: true` (`checkDerivedDatastores`).
+- `templateCtx` carries `datastores.<ds>.preset` (held, or the named `--preset` for builds via `upcoming`) and `env.{id,slug}`.
+- External upkeep `when:` (`src/core/external-triggers.ts`) are walked on disk and keyed by absolute path; worktree globs match only relative paths and vice versa (`matcherOf`). Keep the base/ancestor refusal and the entry cap. `tests/mongo-es-datastores.test.ts`, `tests/namespaces-and-external-triggers.test.ts`.
