@@ -15,7 +15,7 @@ run under `sh` in the worktree; write POSIX sh.
 | `services.<svc>.cwd` | Working directory, relative to the repo root. |
 | `services.<svc>.ready` | Readiness: `http` (path answering 200), `log` (regex), or `cmd` (exit 0); `timeout` seconds (120). Not templated: `cmd` runs in the repo root (not the service's `cwd`) with the service's environment, so it reads templated values from its `env:` (`$PORT`, not `{{ports.web}}`). |
 | `services.<svc>.fatal_logs` | Regex that fails the start at once when it appears in the log. |
-| `services.<svc>.depends_on` | Services that must be ready first. |
+| `services.<svc>.depends_on` | Services that must be ready first. A service starts as soon as its own `depends_on` are ready; services that do not depend on each other start at once (an `up`, a restart after a restore, a wake). |
 | `services.<svc>.idle` | Idle time before the service is stopped (`90s`, `30m`, `2h`, seconds, or `never`). Default 5 minutes. |
 | `services.<svc>.resources` | Cost for the load budget: `{ memory, cpu, build: { memory, cpu } }`. Default 512M / 0.5 cpu running, 1G / 1 cpu building. |
 | `datastores.<ds>.driver` | `sqlite`, `postgres`, `mssql`, `mysql`, `redis`, `mongodb` or `elasticsearch`. Required. Every driver but sqlite is command-driven: runly runs the commands below and embeds no client. |
