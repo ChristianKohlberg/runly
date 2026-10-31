@@ -31,8 +31,15 @@ lowercasing alone could fold two environments onto one name — a hash of the
 ORIGINAL identity is appended whenever lowering changed anything, and a name
 over 63 bytes is cut in the middle keeping that hash, as before. Template
 databases follow the same rule. The other drivers' names are unchanged, so no
-existing namespace moves. `pool doctor` compares a case-folding driver's
-listed names with the lowercase form of its stack prefixes.
+existing namespace moves — except the namespace of a datastore whose
+manifest entry moves it: a datastore exists in an environment only under the
+name the CURRENT manifest gives it, so a consumer that switches a store from
+a stand-in driver (`driver: mysql` running `mongosh` commands, whose names are
+mixed case) to `mongodb` gets its store restored under the new name on the
+next `up` (or wake), with the preset it held, and the old namespace dropped
+by its recorded recipe first. `pool doctor` compares a case-folding driver's
+listed names with its stack prefixes without case, so a mixed-case leftover
+of such a switch is runly's to report and fix, not foreign.
 
 **Elasticsearch is a datastore, and its state is derived.** An Elasticsearch
 namespace is an index-name prefix: the stack's indices and aliases are
@@ -76,8 +83,14 @@ matched, hashed and recorded by absolute path, so the template key does not
 depend on where a worktree sits and shared templates (0044) stay shared. A
 worktree glob never matches an external file and the reverse. Bounds: the walk
 never starts at `/`, the worktree or one of its ancestors; never enters `.git`
-or `node_modules`; follows no symlink; and a walk past 20000 entries fails the
-bind as a work-error naming the rule, instead of hashing a tree. Hashes are
+or `node_modules`; follows no symlink below the literal directory; and a walk
+past 20000 entries fails the bind as a work-error naming the rule, instead of
+hashing a tree. A symlink in the literal directory's own path is followed —
+the walk runs in the real directory and the refusal is judged on real paths
+(so a link cannot hide the worktree's ancestor), while files keep the path as
+written. For a bare repository with linked worktrees, `{{main_worktree}}` is
+the directory holding it; where git cannot tell, it is the stack root, with a
+warning, and is asked again on the next bind rather than remembered. Hashes are
 cached by stat in the worktree's trigger cache like any other trigger.
 
 ## Rationale

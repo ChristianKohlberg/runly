@@ -47,8 +47,11 @@ run under `sh` in the worktree; write POSIX sh.
 
 Templates are resolved in `services.<svc>.run`, `services.<svc>.build` (its
 command) and the values of `services.<svc>.env`, and in `auth.token` (which also
-gets `{{role}}`). Nothing else is templated — not `ready`, `cwd`, `upkeep`,
-`appliances` or `preview`. Datastore commands take only their own variables:
+gets `{{role}}`); a `{{…}}` there that names no variable below (a typo, an
+undeclared port, service or datastore) is refused when the manifest is loaded.
+Nothing else is templated — not `ready`, `cwd`, `appliances`, `preview`, nor
+upkeep `run:`; upkeep `when:` accepts exactly one variable, a leading
+`{{main_worktree}}` (below). Datastore commands take only their own variables:
 `url`, `drop` `{{ns}}`; `create` `{{ns}}`, `{{preset}}`; `template_restore`
 `{{template}}`, `{{ns}}`.
 
@@ -106,6 +109,13 @@ datastores:
     list: curl -fsS 'http://127.0.0.1:9200/_cat/indices?h=index&expand_wildcards=all'
 ```
 
+A datastore lives in an environment under the name its current manifest
+entry gives it. Changing what decides that name — switching an existing
+datastore to `mongodb` from another driver, say — restores it under the new
+name on the next `up` (with the preset it held) and drops the old namespace
+with the drop recorded for it; `pool doctor` also reports mixed-case leftovers
+on a `mongodb` or `elasticsearch` server as runly's.
+
 ## Upkeep triggers outside the worktree
 
 A `when:` normally names worktree files, as git lists them. It may also name
@@ -116,13 +126,19 @@ files elsewhere — data another checkout provides:
 | `../other/data/**` | the worktree (the stack root) |
 | `/srv/exports/**` | absolute |
 | `~/exports/**` | the daemon user's home |
-| `{{main_worktree}}/../other/data/**` | the repository's main worktree — the same directory for every linked worktree, however deep (`.worktree/<name>`). The form to commit. |
+| `{{main_worktree}}/../other/data/**` | the repository's main worktree — the same directory for every linked worktree, however deep (`.worktree/<name>`); for a bare repository with linked worktrees, the directory holding it (`proj/.bare` → `proj`). The form to commit. Only at the start of `when:`; no other `{{…}}` is allowed there. |
 
 Such files are found by walking the disk from the glob's literal directory, not
 through git, and are recorded by absolute path, so linked worktrees compute the
 same template key and share the template. The walk never starts at `/`, the
 worktree or an ancestor of it (that would cover the worktree and its siblings),
-never enters `.git` or `node_modules`, follows no symlink, and fails the bind
-with a work-error past 20000 entries. A directory that does not exist matches
-nothing. Only upkeep `when:` reaches outside; build `when:`, `outputs:`,
+never enters `.git` or `node_modules`, follows no symlink below the glob's
+literal directory, and fails the bind with a work-error past 20000 entries. A
+symlink in the literal directory's own path (the directory itself or a
+component above it) is followed: the walk runs in the real directory, the
+worktree/ancestor refusal is checked on the real paths, and files keep the path
+as written. A directory that does not exist matches nothing. When the main
+worktree cannot be determined (no git checkout), `{{main_worktree}}` is the
+stack root, with a warning in `runly status`, and is asked again on the
+next `up`. Only upkeep `when:` reaches outside; build `when:`, `outputs:`,
 `caches:` and `sync.include` stay inside the worktree.

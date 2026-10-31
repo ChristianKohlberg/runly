@@ -1,6 +1,6 @@
 # 0012. Services are commands, not containers; backing infra is external and probed
 
-- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): `watch_run` and `hot_reload` are accepted and ignored (`--watch` is gone); a service's `build:` runs on every `up`, and its `outputs:` decide whether it restarts; amended by [0038](0038-time-stamped-logs-and-build-skip.md): `outputs:` may compare content (`{paths, compare: content}`)
+- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): `watch_run` and `hot_reload` are accepted and ignored (`--watch` is gone); a service's `build:` runs on every `up`, and its `outputs:` decide whether it restarts; amended by [0038](0038-time-stamped-logs-and-build-skip.md): `outputs:` may compare content (`{paths, compare: content}`); amended by [0050](0050-mongodb-elasticsearch-derived-datastores.md): `mongodb` and `elasticsearch` join the command-driven datastores.
 
 ## Decision
 

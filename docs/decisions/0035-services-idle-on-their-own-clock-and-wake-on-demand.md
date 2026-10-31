@@ -1,6 +1,6 @@
 # 0035. Each service stops on its own idle clock and starts on demand; an environment goes with its agent or its worktree
 
-- Status: Environment lifetime and idle policy superseded by [0046](0046-worktree-owned-activity-lifecycle.md): five-minute environment-wide activity, no agent-death teardown.
+- Status: Environment lifetime and idle policy superseded by [0046](0046-worktree-owned-activity-lifecycle.md): five-minute environment-wide activity, no agent-death teardown; how a wake starts its `depends_on` closure amended by [0051](0051-services-start-concurrently-by-depends-on.md): concurrently, each service once its own dependencies are ready.
 - Date: 2026-10
 - Amends: [0021](0021-quiesce-is-not-a-teardown.md) — the leased-idle quiesce of a
   whole environment (`leasedIdleTtlMs`) is replaced by a per-service idle stop

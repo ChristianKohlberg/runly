@@ -1,6 +1,6 @@
 # 0039. A teardown keeps the worktree's templates and records; a leased environment survives a crash loop; only verbs that use an environment are activity; the daemon may be supervised; a datastore may exist only as copies
 
-- Status: Crash-loop retention amended by [0046](0046-worktree-owned-activity-lifecycle.md): retain environments with or without a lease; public-preview policy by [0047](0047-public-preview-deadlines.md).
+- Status: Crash-loop retention amended by [0046](0046-worktree-owned-activity-lifecycle.md): retain environments with or without a lease; public-preview policy by [0047](0047-public-preview-deadlines.md); a failed boot beside concurrent starts by [0051](0051-services-start-concurrently-by-depends-on.md).
 - Date: 2026-10
 - Amends: [0007](0007-hygiene-levels.md) — a crash loop degrades only an
   unleased environment; [0032](0032-environments-run-in-the-callers-worktree.md)

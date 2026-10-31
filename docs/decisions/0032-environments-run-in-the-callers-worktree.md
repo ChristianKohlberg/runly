@@ -1,6 +1,6 @@
 # 0032. Environments run in the caller's worktree — one per worktree — `up` is the only bind verb, and runly runs no checks
 
-- Status: Environment retention amended by [0046](0046-worktree-owned-activity-lifecycle.md); manifest discovery by [0048](0048-manifest-names-and-skills.md).
+- Status: Environment retention amended by [0046](0046-worktree-owned-activity-lifecycle.md); manifest discovery by [0048](0048-manifest-names-and-skills.md); upkeep `when:` may reach outside the worktree by [0050](0050-mongodb-elasticsearch-derived-datastores.md).
 - Date: 2026-10
 - Supersedes: [0004](0004-watchers-never-move-bindings-move.md) (environments own a
   tree), [0005](0005-git-sync-immutable-bindings.md) (sync transport, immutable
