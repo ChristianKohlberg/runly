@@ -54,9 +54,23 @@ describe('stack.schema.json', () => {
       validate({
         name: 'x',
         services: { web: { run: 'node s.mjs' } },
-        datastores: { main: { driver: 'mongodb' } },
+        datastores: { main: { driver: 'cassandra' } },
       }),
     ).toBe(false);
+  });
+
+  it('accepts mongodb and a derived elasticsearch datastore (decision 0050)', () => {
+    const ok = validate({
+      name: 'x',
+      services: { web: { run: 'node s.mjs', env: { P: '{{datastores.db.preset}}', E: '{{env.slug}}' } } },
+      datastores: {
+        db: { driver: 'mongodb', url: 'mongodb://h/{{ns}}', presets: ['hlt', 'demo'], create: 'seed {{ns}} {{preset}}', template_restore: 'r {{template}} {{ns}}', drop: 'd {{ns}}', list: 'l' },
+        search: { driver: 'elasticsearch', ephemeral: true, derived_from: 'db', url: 'http://h', drop: 'd {{ns}}' },
+      },
+      upkeep: [{ when: '{{main_worktree}}/../data/**', run: '@rebake-template db' }],
+    });
+    expect(validate.errors ?? []).toEqual([]);
+    expect(ok).toBe(true);
   });
 
   it('rejects invalid symbolic port names', () => {

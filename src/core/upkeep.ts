@@ -8,11 +8,12 @@
  * rest of the worktree and no record of builds.
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { cmdTimeoutS, runBounded } from './exec.js';
 import { existsSync } from 'node:fs';
 import { globToRegex, sha256, fileHash, BrokerError, commandFailure, safeJoin } from './util.js';
-import { enumerateSource, enumerateSourceStats } from './worktree.js';
+import { enumerateSourceStats } from './worktree.js';
+import { enumerateExternal, externalGlob, triggerPath } from './external-triggers.js';
 import { recordMetric } from './metrics.js';
 import { stackIdentity, upkeepOutputs, type Manifest } from './manifest.js';
 
@@ -55,14 +56,35 @@ export interface UpkeepOptions {
 export const ruleKey = (rule: { when: string; run: string }): string => `${rule.when} -> ${rule.run}`;
 
 /**
- * The worktree files any upkeep rule's `when:` glob matches — the only files a
- * bind reads to decide what upkeep is due. Empty, without asking git, when the
- * manifest declares no rules.
+ * The files any upkeep rule's `when:` glob matches — the only files a bind
+ * reads to decide what upkeep is due: worktree files as paths relative to the
+ * root (git's listing), files outside it as absolute paths (decision 0050).
+ * Empty, without asking git, when the manifest declares no rules.
  */
 export async function triggerFiles(root: string, manifest: Manifest): Promise<string[]> {
-  const whens = (manifest.upkeep ?? []).map((rule) => rule.when);
-  return whens.length === 0 ? [] : enumerateSource(root, manifest, whens);
+  return (await listTriggers(root, manifest)).map((f) => f.path);
 }
+
+async function listTriggers(root: string, manifest: Manifest): Promise<Array<{ path: string; size: number; mtimeMs: number }>> {
+  const whens = (manifest.upkeep ?? []).map((rule) => rule.when);
+  const inside = whens.filter((w) => externalGlob(root, w) === null);
+  const outside = whens.filter((w) => !inside.includes(w));
+  return [
+    ...(inside.length === 0 ? [] : await enumerateSourceStats(root, manifest, inside)),
+    ...(outside.length === 0 ? [] : await enumerateExternal(root, outside)),
+  ];
+}
+
+/**
+ * Does `file` belong to `when`? A worktree glob matches worktree files only
+ * (relative paths) and an external glob, resolved to its absolute form,
+ * external files only — `**\/package.json` must not fire on a sibling repo.
+ */
+const matcherOf = (root: string, when: string): ((file: string) => boolean) => {
+  const external = externalGlob(root, when);
+  const re = globToRegex(external ?? when);
+  return (file) => isAbsolute(file) === (external !== null) && re.test(file);
+};
 
 /**
  * The trigger files with their content hashes, read once per bind.
@@ -89,8 +111,7 @@ const RACY_WINDOW_MS = 2000;
 
 export async function triggerSet(root: string, manifest: Manifest, cacheDir?: string): Promise<TriggerSet> {
   // The listing's own stat is the cache's check: one stat per trigger file.
-  const whens = (manifest.upkeep ?? []).map((rule) => rule.when);
-  const listed = whens.length === 0 ? [] : await enumerateSourceStats(root, manifest, whens);
+  const listed = await listTriggers(root, manifest);
   const files = listed.map((f) => f.path);
   const statOfListed = new Map(listed.map((f) => [f.path, f]));
   let cache: { writtenAt?: number; entries: Record<string, TriggerCacheEntry> } = { entries: {} };
@@ -106,7 +127,7 @@ export async function triggerSet(root: string, manifest: Manifest, cacheDir?: st
   const next: Record<string, TriggerCacheEntry> = {};
   const hashes = new Map<string, string | null>();
   for (const rel of files) {
-    const abs = join(root, rel);
+    const abs = triggerPath(root, rel);
     const st = statOfListed.get(rel);
     if (!st) {
       hashes.set(rel, null);
@@ -124,15 +145,15 @@ export async function triggerSet(root: string, manifest: Manifest, cacheDir?: st
     writeFileSync(tmp, JSON.stringify({ root, writtenAt: Date.now(), entries: next }));
     renameSync(tmp, join(cacheDir, 'triggers.json'));
   }
-  return { files, hashOf: (rel) => (hashes.has(rel) ? (hashes.get(rel) ?? null) : fileHash(join(root, rel))) };
+  return { files, hashOf: (rel) => (hashes.has(rel) ? (hashes.get(rel) ?? null) : fileHash(triggerPath(root, rel))) };
 }
 
 /** The fingerprint of one `when:` glob: the content of exactly the files it matches. */
 export function triggerHash(root: string, files: string[] | TriggerSet, when: string): string {
-  const re = globToRegex(when);
+  const re = matcherOf(root, when);
   const list = Array.isArray(files) ? files : files.files;
-  const hashOf = Array.isArray(files) ? (rel: string) => fileHash(join(root, rel)) : files.hashOf;
-  const matching = list.filter((f) => re.test(f)).sort();
+  const hashOf = Array.isArray(files) ? (rel: string) => fileHash(triggerPath(root, rel)) : files.hashOf;
+  const matching = list.filter(re).sort();
   return sha256(matching.map((f) => `${f}:${hashOf(f) ?? 'gone'}`).join('\n'));
 }
 

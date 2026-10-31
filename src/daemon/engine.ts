@@ -6,10 +6,10 @@ import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync } from 'node:f
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, NO_LEASE_EXPIRY, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow, type PreviewRestore } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { buildOf, canonicalDirectory, findStackRoot, envDatastoreNames, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
+import { CASE_FOLDING_DRIVERS, buildOf, canonicalDirectory, defaultPreset, derivedDatastores, findStackRoot, envDatastoreNames, type DatastoreSpec, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
 import { forgetNamespace, recordedNamespaces } from '../core/namespaces.js';
-import { runlyEnvVars } from '../core/env-vars.js';
+import { envSlug, runlyEnvVars } from '../core/env-vars.js';
 import { buildInputsKey, buildIsCurrent, clearBuilds, everBuilt, forgetBuild, recordBuild } from '../core/builds.js';
 import { LogWriter, UPKEEP_LOG, beginBuildLog, buildLogOf, logFileOf, readLog } from '../core/logs.js';
 import { formatDuration, parseDuration } from '../core/units.js';
@@ -131,6 +131,25 @@ class ServiceFailure extends BrokerError {}
  * an agent that crashed kept its environment until the TTL expired. A pid plus
  * its start time can be checked cheaply and survives pid reuse.
  */
+/**
+ * `{{datastores.<ds>.preset}}` (decision 0050): the preset the datastore holds
+ * — or, while a bind is about to restore a named one, that preset. Before the
+ * first restore it is the preset the first restore will use.
+ */
+function templatePreset(name: string, spec: DatastoreSpec, held: string | undefined): string {
+  if (held !== undefined) return held;
+  try {
+    return presetToRestore(name, spec, undefined);
+  } catch {
+    return defaultPreset(spec);
+  }
+}
+
+/** `names` plus every datastore derived from one of them (decision 0050). */
+function withDerived(manifest: Manifest, names: string[]): string[] {
+  return [...new Set([...names, ...names.flatMap((n) => derivedDatastores(manifest, n))])];
+}
+
 /** A datastore's template scope in this stack (decision 0044): its bake key, shared per manifest name. */
 function templateScope(stack: Stack, bakeKeys: Record<string, string>, name: string, privateBake = false): TemplateScope {
   return { bakeKey: bakeKeys[name], project: stack.manifest.name, ...(privateBake ? { privateBake } : {}) };
@@ -919,22 +938,24 @@ export class Engine {
    * service must listen on. `{{public_ports.<key>}}` is always the public one,
    * for a service that has to advertise its own address.
    */
-  private templateCtx(stack: Stack, env: EnvRow, own?: { key: string; port: number }) {
+  private templateCtx(stack: Stack, env: EnvRow, own?: { key: string; port: number }, upcoming: Record<string, string> = {}) {
     const services: Record<string, { url: string }> = {};
     for (const [name, spec] of Object.entries(stack.manifest.services)) {
       if (spec.port) services[name] = { url: `http://localhost:${env.ports[spec.port]}` };
     }
     const ports = own ? { ...env.ports, [own.key]: own.port } : env.ports;
-    const datastores: Record<string, { url: string; ns: string }> = {};
+    const datastores: Record<string, { url: string; ns: string; preset: string }> = {};
     const dirs = this.envDirs(env.id);
     const h: DsHandle = { envId: env.id, cwd: env.stackRoot, dataDir: dirs.data };
     for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
       // A copies_only datastore (decision 0039) has no namespace in an environment.
       if (spec.copies_only === true) continue;
       const ds = makeDatastore(name, spec, stack.id);
-      datastores[name] = { url: ds.url(h), ns: ds.ns(h) };
+      datastores[name] = { url: ds.url(h), ns: ds.ns(h), preset: templatePreset(name, spec, upcoming[name] ?? env.presets[name]) };
     }
-    return { ports, public_ports: env.ports, services, datastores };
+    // `{{env.id}}` / `{{env.slug}}` (decision 0050): stable for the
+    // environment's life; the slug is the lowercase, DNS-label-safe form.
+    return { ports, public_ports: env.ports, services, datastores, env: { id: env.id, slug: envSlug(env.id) } };
   }
 
   private supervisor(env: EnvRow): EnvSupervisor {
@@ -1403,7 +1424,7 @@ export class Engine {
 
     if (keepRunning) {
       trace.phase('build');
-      const buildCtx = this.templateCtx(stack, env);
+      const buildCtx = this.templateCtx(stack, env, undefined, reloadPresets);
       const toRestart = new Set<string>();
       await this.treeLocked(stack.id, () => this.inWaves(this.buildWaves(stack, active), async (name) => {
         const spec = serviceOf(stack, name);
@@ -1443,7 +1464,8 @@ export class Engine {
       // running services that use it stop first and start again on the new
       // data. Who uses it is read from the manifest; if nothing references it,
       // nobody can tell, so every running service restarts.
-      const reloads = Object.keys(reloadPresets);
+      // A derived datastore (decision 0050) is flushed with its source.
+      const reloads = withDerived(stack.manifest, Object.keys(reloadPresets));
       for (const ds of reloads) {
         const users = this.datastoreUsers(stack, ds);
         for (const name of running) if (users === null || users.has(name)) toRestart.add(name);
@@ -1503,14 +1525,17 @@ export class Engine {
     // restored (or baked) while the services build, and the services start
     // only once both are done. A build's templates may name a datastore's url
     // or ns — both are derived from the environment, not from the restore.
+    // A datastore derived from one that is restored here (created, reset,
+    // reloaded, re-restored for a new template) is flushed too (decision 0050).
+    const forced = (name: string): boolean => reloadPresets[name] !== undefined || hygiene !== 'reuse' || staleTemplate(name);
+    const restoring = (name: string): boolean => forced(name) || !env.datastoreNs[name];
     const data = async () => {
       const t0 = performance.now();
       try {
-        await this.prepareDatastores(stack, env, bakeKeys, this.envDatastores(stack).map((name) => ({
-          name,
-          force: reloadPresets[name] !== undefined || hygiene !== 'reuse' || staleTemplate(name),
-          preset: reloadPresets[name],
-        })), say, privateBakes);
+        await this.prepareDatastores(stack, env, bakeKeys, this.envDatastores(stack).map((name) => {
+          const source = stack.manifest.datastores?.[name]?.derived_from;
+          return { name, force: forced(name) || (source !== undefined && restoring(source)), preset: reloadPresets[name] };
+        }), say, privateBakes);
       } finally {
         phaseMs.data = performance.now() - t0;
       }
@@ -1520,7 +1545,7 @@ export class Engine {
     // last successful build (decision 0038). runly keeps no build cache —
     // MSBuild, pnpm and the Angular CLI decide what is already up to date.
     // Under the worktree lock: `runly warm` builds into the same output.
-    const ctx = this.templateCtx(stack, env);
+    const ctx = this.templateCtx(stack, env, undefined, reloadPresets);
     const builds = async () => {
       const t0 = performance.now();
       try {
@@ -3712,10 +3737,13 @@ export class Engine {
     // A namespace cut to 63 bytes may have lost its stack id: those are
     // recorded with their stack when they are created (W4).
     const recorded = recordedNamespaces();
-    const ownerOf = (ns: string): string | undefined => {
+    // A case-folding driver's names (mongodb, elasticsearch — decision 0050)
+    // are the lowercase form of the same prefixes.
+    const startsWith = (ns: string, p: string, fold: boolean) => (fold ? ns.startsWith(p.toLowerCase()) : ns.startsWith(p));
+    const ownerOf = (ns: string, fold: boolean): string | undefined => {
       const rec = recorded.get(ns);
       if (rec !== undefined) return rec;
-      return [...knownStacks].find((id) => prefixesOf(id).some((p) => ns.startsWith(p)));
+      return [...knownStacks].find((id) => prefixesOf(id).some((p) => startsWith(ns, p, fold)));
     };
     // In flight: a bind (busy env) or a copy being created or dropped. Their
     // namespaces are referenced above already; this also covers a row a
@@ -3725,15 +3753,22 @@ export class Engine {
       const spec = st.manifest.datastores?.[ds];
       if (!spec?.list || !spec.drop) continue;
       const drop = spec.drop;
+      const fold = CASE_FOLDING_DRIVERS.has(spec.driver);
       const r = await runBounded(spec.list, st.root, cmdTimeoutS());
       if (r.code !== 0 || r.timedOut) {
         findings.push({ kind: 'list-failed', what: `${st.manifest.name}:${ds}`, detail: `its list: hook failed (${r.timedOut ? 'timed out' : `exit ${r.code}`}) — namespaces not checked` });
         continue;
       }
-      const names = r.output.split('\n').map((l) => l.trim()).filter((l) => /^backlot_[A-Za-z0-9_]+$/.test(l));
+      // Elasticsearch (decision 0050): the namespace is an index-name PREFIX,
+      // so `list:` may print index or alias names; each is reduced to the
+      // namespace before its first `-` or `.`, and a name under a referenced
+      // prefix (any separator) is referenced — a live index is never an orphan.
+      const es = spec.driver === 'elasticsearch';
+      const names = r.output.split('\n').map((l) => l.trim()).map((l) => (es ? (l.split(/[-.]/)[0] ?? '') : l)).filter((l) => /^backlot_[A-Za-z0-9_]+$/.test(l));
+      const isReferenced = (ns: string) => referencedNs.has(ns) || (es && [...referencedNs].some((ref) => ns.startsWith(ref)));
       for (const ns of new Set(names)) {
-        if (referencedNs.has(ns)) continue;
-        const owner = ownerOf(ns);
+        if (isReferenced(ns)) continue;
+        const owner = ownerOf(ns, fold);
         const finding: (typeof findings)[number] = owner !== undefined
           ? { kind: 'namespace', what: ns, detail: `datastore '${ds}' lists it and no environment, copy or template references it` }
           : { kind: 'foreign-namespace', what: ns, detail: `in runly's naming, but of a stack this state root has no record of (another state root's?) — never touched` };
@@ -3745,7 +3780,7 @@ export class Engine {
             for (const e of this.journal.allEnvs()) referenceEnv(e);
             for (const c of this.journal.allDbCopies()) referencedNs.add(c.ns);
             for (const m of markersOf(owner)) referencedNs.add(m);
-            if (referencedNs.has(ns) || inFlight().some((p) => ns.startsWith(p)) || [...this.dbBusy].some((name) => this.journal.getDbCopy(name)?.ns === ns)) {
+            if (isReferenced(ns) || inFlight().some((p) => startsWith(ns, p, fold)) || [...this.dbBusy].some((name) => this.journal.getDbCopy(name)?.ns === ns)) {
               finding.detail += ' — claimed by an operation in flight, left alone';
               return;
             }

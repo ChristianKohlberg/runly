@@ -91,7 +91,7 @@ export interface ServiceSpec {
 }
 
 export interface DatastoreSpec {
-  driver: 'sqlite' | 'postgres' | 'mssql' | 'mysql' | 'redis';
+  driver: 'sqlite' | 'postgres' | 'mssql' | 'mysql' | 'redis' | 'mongodb' | 'elasticsearch';
   server?: 'external';
   probe?: string;
   url?: string;
@@ -103,6 +103,15 @@ export interface DatastoreSpec {
   default_preset?: string | { run?: string; session?: string };
   template?: boolean;
   ephemeral?: boolean;
+  /**
+   * Derived state (decision 0050): an `ephemeral` datastore whose content is
+   * computed from another datastore of the stack (a search index fed from the
+   * database). Whenever that source is restored — created, reset, reloaded
+   * with a preset, re-restored for a new template — this one is flushed with
+   * its `drop:` command in the same bind, and the running services that use
+   * it restart with the source's users.
+   */
+  derived_from?: string;
   /**
    * Never provisioned for an environment (decision 0039): it exists only as
    * the source of `runly db new|with` copies. Its template is baked on the
@@ -355,6 +364,7 @@ export function loadStack(from: string, opts: { validate?: boolean } = {}): Stac
   for (const inc of manifest.sync?.include ?? []) safeJoin(root, inc, 'sync.include');
   checkCopiesOnly(manifest, basename(file));
   checkDatastoreNamespaces(manifest);
+  checkDerivedDatastores(manifest, basename(file));
   checkExportNames(manifest);
   // Identity = absolute root + declared name; filesystem-safe. Hash the WHOLE
   // path: slicing base64url(root) kept only the last ~6 bytes, so sibling
@@ -398,6 +408,46 @@ function checkDatastoreNamespaces(manifest: Manifest): void {
     }
     names.set(normalized, name);
   }
+}
+
+/** Drivers whose server folds or forbids case in namespace names (decision 0050). */
+export const CASE_FOLDING_DRIVERS: ReadonlySet<DatastoreSpec['driver']> = new Set(['mongodb', 'elasticsearch']);
+
+/**
+ * Derived and search datastores (decision 0050). An `elasticsearch` datastore
+ * holds derived search state: it is `ephemeral` (no presets, no templates; a
+ * reset is its `drop:`). `derived_from` names the datastore it is computed
+ * from, which must be an ordinary datastore of this stack an environment has.
+ */
+function checkDerivedDatastores(manifest: Manifest, file: string): void {
+  const stores = manifest.datastores ?? {};
+  for (const [name, spec] of Object.entries(stores)) {
+    if (spec.driver === 'elasticsearch') {
+      if (spec.ephemeral !== true) {
+        throw new BrokerError('work-error', `datastore '${name}' (elasticsearch) must be 'ephemeral: true' in ${file}: an index holds derived search state, so it has no presets or templates and a reset is its drop: command`, 'manifest');
+      }
+      for (const key of ['presets', 'default_preset', 'template_restore'] as const) {
+        if (spec[key] !== undefined) throw new BrokerError('work-error', `datastore '${name}' (elasticsearch) declares '${key}' in ${file}, but search state is derived — it has no presets or templates; seed the datastore it is derived from instead`, 'manifest');
+      }
+    }
+    if (spec.derived_from === undefined) continue;
+    const src = stores[spec.derived_from];
+    const why =
+      spec.derived_from === name ? 'itself'
+      : src === undefined ? 'a datastore this manifest does not declare'
+      : src.copies_only === true ? 'a copies_only datastore (an environment has none)'
+      : src.derived_from !== undefined ? 'another derived datastore (one level only)'
+      : undefined;
+    if (why !== undefined) throw new BrokerError('work-error', `datastore '${name}' is derived_from '${spec.derived_from}' in ${file}, which is ${why}`, 'manifest');
+    if (spec.ephemeral !== true || spec.copies_only === true) {
+      throw new BrokerError('work-error', `datastore '${name}' declares derived_from in ${file} but is not 'ephemeral: true' (or is copies_only): only an ephemeral store is flushed when its source is restored`, 'manifest');
+    }
+  }
+}
+
+/** The datastores derived from `source` (decision 0050). */
+export function derivedDatastores(manifest: Manifest, source: string): string[] {
+  return Object.entries(manifest.datastores ?? {}).filter(([, spec]) => spec.derived_from === source).map(([name]) => name);
 }
 
 /** Every string in `value`, with the manifest path it sits at (`services.web.ready.cmd`). */

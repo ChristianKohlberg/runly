@@ -93,8 +93,9 @@ Usage:
                           'db drop'
   runly db with <datastore> [--preset NAME] [--runly-exit N] -- <cmd...>
                           run a command against a fresh copy (RUNLY_DB_URL; the
-                          database's own name in RUNLY_DB_DATABASE; runly's
-                          handle in RUNLY_DB_COPY), drop the copy when it
+                          database's own name in RUNLY_DB_DATABASE, its preset
+                          in RUNLY_DB_PRESET; runly's handle in RUNLY_DB_COPY),
+                          drop the copy when it
                           exits, and exit with its exit code. The command dies
                           with this CLI however it dies. runly's own failures
                           are marked 'runly db with:' on stderr (with --json a
@@ -1360,11 +1361,12 @@ async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
 /**
  * What `db with`'s command reads (and `db new` prints): RUNLY_DB_URL to
  * connect; RUNLY_DB_DATABASE, the database's own name on its server (the file
- * for sqlite); RUNLY_DB_COPY, runly's handle for `db drop`. RUNLY_DB_NAME is
+ * for sqlite); RUNLY_DB_PRESET, the preset it was restored with (decision
+ * 0050); RUNLY_DB_COPY, runly's handle for `db drop`. RUNLY_DB_NAME is
  * the handle too, kept for the scripts that read it.
  */
 function dbVars(copy: DbCopy): Record<string, string> {
-  return { RUNLY_DB_URL: copy.url, RUNLY_DB_DATABASE: copy.ns, RUNLY_DB_COPY: copy.name, RUNLY_DB_NAME: copy.name };
+  return { RUNLY_DB_URL: copy.url, RUNLY_DB_DATABASE: copy.ns, RUNLY_DB_PRESET: copy.preset, RUNLY_DB_COPY: copy.name, RUNLY_DB_NAME: copy.name };
 }
 
 /** A plain, aligned table; `-` for an empty cell. */

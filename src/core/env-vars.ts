@@ -8,12 +8,30 @@
  *
  * Names are uppercased, any other character becomes `_`.
  */
+import { createHash } from 'node:crypto';
+
 export interface EnvVarSource {
   envId: string;
   ports?: Record<string, number>;
   urls?: Record<string, string>;
   datastores?: Record<string, { url: string; preset?: string | null }>;
   logins?: { user: string; password: string } | null;
+}
+
+/**
+ * `{{env.slug}}` (decision 0050): the environment id as a lowercase name that
+ * is safe where case is folded or forbidden — an Elasticsearch index, a DNS
+ * label, a container or MongoDB database name: `[a-z0-9-]`, at most 63 bytes.
+ * Environment ids are mixed case (`nova-parla-A8mQi2kG-e1`), so when folding
+ * changed anything a hash of the original id is appended; two ids that differ
+ * only in case never share a slug. Deterministic: the same id, the same slug.
+ */
+export function envSlug(id: string): string {
+  const LIMIT = 63;
+  const base = id.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+  if (base === id && base.length <= LIMIT) return base;
+  const suffix = `-${createHash('sha256').update(id).digest('hex').slice(0, 8)}`;
+  return base.slice(0, LIMIT - suffix.length) + suffix;
 }
 
 /** `web-audit` -> `WEB_AUDIT`: a valid, stable shell variable suffix. */

@@ -3,7 +3,7 @@
  *
  * Two families:
  *  - sqlite: fully engine-native — the ns IS a file; template restore is a copy.
- *  - command (postgres/mssql/mysql/redis): ALL mechanics are repo-declared
+ *  - command (postgres/mssql/mysql/redis/mongodb/elasticsearch): ALL mechanics are repo-declared
  *    commands ({{ns}}/{{preset}}/{{template}} resolved by the engine). runly
  *    embeds no database clients — the anti-scope ("orchestrate, don't
  *    reimplement") applied to data.
@@ -33,10 +33,10 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
-import { recordNamespace } from '../core/namespaces.js';
+import { NS_LIMIT, recordNamespace } from '../core/namespaces.js';
 import { sha256, template, BrokerError, commandFailure } from '../core/util.js';
 import { runBounded, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
-import { defaultPreset, type DatastoreSpec } from '../core/manifest.js';
+import { CASE_FOLDING_DRIVERS, defaultPreset, type DatastoreSpec } from '../core/manifest.js';
 import { logEvent } from '../core/events.js';
 import { measureMetric, recordMetric, type MetricLabels } from '../core/metrics.js';
 
@@ -605,6 +605,29 @@ function dropSidecars(dbPath: string): void {
 
 // ---------------------------------------------------------------- command family
 
+/**
+ * A server namespace from its sanitized identity (`[A-Za-z0-9_]`), at most
+ * NS_LIMIT (63) bytes: Postgres's identifier limit, MongoDB's database-name
+ * limit, and short enough to prefix Elasticsearch index names (255 bytes).
+ *
+ * `caseFold` (mongodb, elasticsearch — decision 0050): the name is lowercase.
+ * Elasticsearch refuses uppercase index names, and MongoDB refuses a database
+ * whose name differs from an existing one only in case. Environment ids are
+ * mixed case (`nova-parla-A8mQi2kG-e1`), so lowercasing alone could fold two
+ * of them onto one name; a hash of the ORIGINAL identity is appended whenever
+ * lowercasing changed anything, which keeps the name deterministic and
+ * distinct. A name longer than the limit is cut in the middle and keeps that
+ * hash at the end, as for every other server driver.
+ */
+export function serverNamespace(raw: string, caseFold = false): string {
+  const suffix = `_${sha256(raw).slice(0, 8)}`;
+  const base = caseFold ? raw.toLowerCase() : raw;
+  const folded = base !== raw;
+  if (!folded && base.length <= NS_LIMIT) return base;
+  if (folded && base.length + suffix.length <= NS_LIMIT) return base + suffix;
+  return base.slice(0, NS_LIMIT - suffix.length) + suffix;
+}
+
 class CommandDs implements DsDriver {
   readonly fileBased = false;
   private readonly slots: TemplateSlots;
@@ -630,14 +653,10 @@ class CommandDs implements DsDriver {
     // resolve to the identical database: the second one's clean-slate drop
     // destroys the first's freshly seeded data, and both services are handed
     // the same url.
-    const raw = `backlot_${h.envId}_${this.name}`.replace(/[^A-Za-z0-9_]/g, '_');
     // Postgres truncates identifiers at 63 bytes, and the disambiguating name
     // sits at the END — same defense as templateNs(): trim the middle, keep a
     // hash of the full identity so long names never collapse onto one db.
-    const LIMIT = 63;
-    if (raw.length <= LIMIT) return raw;
-    const suffix = `_${sha256(raw).slice(0, 8)}`;
-    return raw.slice(0, LIMIT - suffix.length) + suffix;
+    return serverNamespace(`backlot_${h.envId}_${this.name}`.replace(/[^A-Za-z0-9_]/g, '_'), CASE_FOLDING_DRIVERS.has(this.spec.driver));
   }
   url(h: DsHandle): string {
     return template(this.spec.url!, { ns: this.ns(h) });
@@ -686,7 +705,8 @@ class CommandDs implements DsDriver {
     // is at the end — so a long stack id silently cut it off and two different
     // templates collapsed onto one database. Trim the stack/preset middle
     // instead, and always keep the hash.
-    const LIMIT = 63;
+    if (CASE_FOLDING_DRIVERS.has(this.spec.driver)) return serverNamespace(raw, true);
+    const LIMIT = NS_LIMIT;
     if (raw.length <= LIMIT) return raw;
     const suffix = `_${hash}${nonce}`;
     return raw.slice(0, LIMIT - suffix.length) + suffix;
@@ -945,6 +965,8 @@ export function makeDatastore(name: string, spec: DatastoreSpec, stackId: string
     case 'mssql':
     case 'mysql':
     case 'redis':
+    case 'mongodb':
+    case 'elasticsearch':
       return new CommandDs(name, spec, stackId, sc);
     default:
       throw new BrokerError('work-error', `unknown datastore driver '${(spec as { driver: string }).driver}'`, 'manifest');
