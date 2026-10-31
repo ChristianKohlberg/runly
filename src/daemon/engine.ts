@@ -137,6 +137,9 @@ class ServiceFailure extends BrokerError {}
  * first restore it is the preset the first restore will use.
  */
 function templatePreset(name: string, spec: DatastoreSpec, held: string | undefined): string {
+  // A store that is KEPT holds `held` even when the catalog dropped it
+  // (decision 0034), and ctx reports the same; a bind that restores a store
+  // passes the preset the restore resolves (`presetToRestore`) as `held`.
   if (held !== undefined) return held;
   try {
     return presetToRestore(name, spec, undefined);
@@ -1110,6 +1113,52 @@ export class Engine {
   }
 
   /**
+   * The namespace datastore `name` has in `env` under the CURRENT manifest.
+   * A recorded namespace that differs is a store the manifest has moved away
+   * from (H1: a driver switch changes the name), not an existing one.
+   */
+  private currentNs(stack: Stack, env: EnvRow, name: string): string | undefined {
+    const spec = stack.manifest.datastores?.[name];
+    if (!spec || spec.copies_only === true) return undefined;
+    return makeDatastore(name, spec, stack.id).ns({ envId: env.id, cwd: stack.root, dataDir: this.envDirs(env.id).data });
+  }
+
+  /** Does the environment hold datastore `name` under its current namespace? */
+  private holdsDatastore(stack: Stack, env: EnvRow, name: string): boolean {
+    const ns = env.datastoreNs[name];
+    return ns !== undefined && ns === this.currentNs(stack, env, name);
+  }
+
+  /**
+   * Give back a datastore's OLD namespace — recorded under a name the
+   * current manifest no longer gives it — by the drop recorded for it
+   * (decision 0037), before anything overwrites that record. A drop that
+   * fails is logged, and the name stays findable by `pool doctor` (it is
+   * runly's naming, of a known stack); the store is restored either way.
+   */
+  private async retireMovedNamespace(stack: Stack, env: EnvRow, name: string, oldNs: string, newNs: string, say: Progress): Promise<void> {
+    const recipe = env.dropRecipes?.[name];
+    say(`datastore '${name}' moved from ${oldNs} to ${newNs}: dropping the old namespace`);
+    try {
+      if (!recipe || (recipe.ns !== undefined && recipe.ns !== oldNs)) throw new Error('no drop is recorded for the old namespace');
+      await measureMetric('datastore.drop_ms', { stack: stack.id, envId: env.id, datastore: name, reason: 'moved' }, () => this.runDropRecipe(recipe, recipe.cwd && existsSync(recipe.cwd) ? recipe.cwd : stack.root));
+      logEvent({ level: 'info', kind: 'datastore', envId: env.id, detail: `datastore '${name}' moved from ${oldNs} to ${newNs} (its manifest entry changed): the old namespace was dropped` });
+    } catch (err) {
+      logEvent({ level: 'warn', kind: 'datastore', envId: env.id, detail: `datastore '${name}' moved from ${oldNs} to ${newNs}, but the old namespace was NOT dropped — 'runly pool doctor --fix' can drop it: ${String((err as Error).message ?? err)}` });
+    }
+    delete env.datastoreNs[name];
+    if (env.templates) delete env.templates[name];
+    if (env.dropRecipes) delete env.dropRecipes[name];
+    const live = this.journal.getEnv(env.id);
+    if (live) {
+      delete live.datastoreNs[name];
+      if (live.templates) delete live.templates[name];
+      if (live.dropRecipes) delete live.dropRecipes[name];
+      this.journal.saveEnv(live);
+    }
+  }
+
+  /**
    * Create, keep or reload each datastore in `plan` — all of them at once
    * (0.19): each bakes and restores under its own datastore lock, so three
    * datastores cost the slowest one, not their sum. Every completed restore is
@@ -1135,7 +1184,15 @@ export class Engine {
       const ds = makeDatastore(step.name, spec, stack.id, templateScope(stack, bakeKeys, step.name, privateBakes.has(step.name)));
       await ds.probe();
       const held = env.presets[step.name];
-      const exists = Boolean(env.datastoreNs[step.name]);
+      // The store EXISTS only under the name the current manifest gives it.
+      // A recorded namespace with another name (the driver changed, say
+      // `mysql` → `mongodb`, whose names are lowercase) is the old store:
+      // it is dropped by its recorded recipe BEFORE the new recipe replaces
+      // that record, and the store is restored under its new name.
+      const nsNow = ds.ns(dsHandle);
+      const recorded = env.datastoreNs[step.name];
+      if (recorded !== undefined && recorded !== nsNow) await this.retireMovedNamespace(stack, env, step.name, recorded, nsNow, say);
+      const exists = env.datastoreNs[step.name] === nsNow;
       const preset = step.preset ?? presetToRestore(step.name, spec, held);
       const restores = step.force || !exists;
       if (restores) say(`preparing datastore '${step.name}' (${preset})`);
@@ -1145,7 +1202,7 @@ export class Engine {
       env.dropRecipes = { ...(env.dropRecipes ?? {}), [step.name]: ds.dropRecipe(dsHandle) };
       this.journal.saveEnv({ ...(this.journal.getEnv(env.id) ?? env), dropRecipes: env.dropRecipes });
       await ds.ensure(dsHandle, preset, step.force, exists);
-      env.datastoreNs[step.name] = ds.ns(dsHandle);
+      env.datastoreNs[step.name] = nsNow;
       // A kept store still holds what it held; only a restore changes that.
       env.presets[step.name] = restores || held === undefined ? preset : held;
       if (restores) {
@@ -1528,7 +1585,7 @@ export class Engine {
     // A datastore derived from one that is restored here (created, reset,
     // reloaded, re-restored for a new template) is flushed too (decision 0050).
     const forced = (name: string): boolean => reloadPresets[name] !== undefined || hygiene !== 'reuse' || staleTemplate(name);
-    const restoring = (name: string): boolean => forced(name) || !env.datastoreNs[name];
+    const restoring = (name: string): boolean => forced(name) || !this.holdsDatastore(stack, env, name);
     const data = async () => {
       const t0 = performance.now();
       try {
@@ -1545,7 +1602,15 @@ export class Engine {
     // last successful build (decision 0038). runly keeps no build cache —
     // MSBuild, pnpm and the Angular CLI decide what is already up to date.
     // Under the worktree lock: `runly warm` builds into the same output.
-    const ctx = this.templateCtx(stack, env, undefined, reloadPresets);
+    // A build runs before (next to) the restore, so it sees the preset each
+    // store is ABOUT to hold — resolved exactly as prepareDatastores resolves
+    // it — and the held one for a store that is kept.
+    const upcoming: Record<string, string> = {};
+    for (const name of this.envDatastores(stack)) {
+      const spec = stack.manifest.datastores?.[name];
+      if (spec && restoring(name)) upcoming[name] = reloadPresets[name] ?? presetToRestore(name, spec, env.presets[name]);
+    }
+    const ctx = this.templateCtx(stack, env, undefined, upcoming);
     const builds = async () => {
       const t0 = performance.now();
       try {
@@ -3768,12 +3833,15 @@ export class Engine {
     // recorded with their stack when they are created (W4).
     const recorded = recordedNamespaces();
     // A case-folding driver's names (mongodb, elasticsearch — decision 0050)
-    // are the lowercase form of the same prefixes.
-    const startsWith = (ns: string, p: string, fold: boolean) => (fold ? ns.startsWith(p.toLowerCase()) : ns.startsWith(p));
+    // are the lowercase form of the same prefixes — and its server may still
+    // hold MIXED-case names from before the datastore switched to it (a
+    // `driver: mysql` stand-in for MongoDB): both are compared without case.
+    // An exact match wins, so case folding never moves a name to another stack.
+    const startsWith = (ns: string, p: string, fold: boolean) => (fold ? ns.toLowerCase().startsWith(p.toLowerCase()) : ns.startsWith(p));
     const ownerOf = (ns: string, fold: boolean): string | undefined => {
       const rec = recorded.get(ns);
       if (rec !== undefined) return rec;
-      return [...knownStacks].find((id) => prefixesOf(id).some((p) => startsWith(ns, p, fold)));
+      return [...knownStacks].find((id) => prefixesOf(id).some((p) => ns.startsWith(p))) ?? [...knownStacks].find((id) => prefixesOf(id).some((p) => startsWith(ns, p, fold)));
     };
     // In flight: a bind (busy env) or a copy being created or dropped. Their
     // namespaces are referenced above already; this also covers a row a
@@ -4897,10 +4965,15 @@ export class Engine {
     try {
       const say: Progress = opts.say ?? (() => undefined);
       await this.ensureAppliances(stack, say, reservation);
-      const missing = this.envDatastores(stack).filter((n) => !env.datastoreNs[n]);
+      // A store the environment does not hold under its current name is
+      // created (restored) — and, as on a bind (decision 0050), every store
+      // derived from one created here is flushed: its content was computed
+      // from a source that did not exist.
+      const missing = this.envDatastores(stack).filter((n) => !this.holdsDatastore(stack, env, n));
       if (missing.length > 0) {
         const bakeKeys = templateBakeKeys(stack.manifest, stack.root, await triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)));
-        await this.prepareDatastores(stack, env, bakeKeys, missing.map((n) => ({ name: n, force: false })), say);
+        const plan = withDerived(stack.manifest, missing).filter((n) => this.envDatastores(stack).includes(n)).map((n) => ({ name: n, force: !missing.includes(n) }));
+        await this.prepareDatastores(stack, env, bakeKeys, plan, say);
       }
       const ctx = this.templateCtx(stack, env);
       await this.treeLocked(stack.id, () => this.runBuilds(stack, env, closure, ctx, say, { rebuild: false, mode: 'wake', decided }));

@@ -176,6 +176,175 @@ describe('mongodb + derived elasticsearch datastores (decision 0050)', () => {
     expect(readdirSync(f.es).sort()).toEqual([`${searchNs}_hes_other`, 'hes.vorgang'].sort());
   }, 120_000);
 
+  it('a datastore whose driver changes (mysql stand-in -> mongodb) is restored under its new name and the old one dropped; doctor knows mixed-case leftovers', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'runly-ns-move-')));
+    dirs.push(root);
+    const server = join(root, 'server');
+    mkdirSync(server);
+    const manifest = (driver: string) => `name: ns-move
+services:
+  web:
+    run: node echo.mjs
+    port: web
+    env:
+      PORT: "{{ports.web}}"
+      PRESET: "{{datastores.Mongo.ns}}"
+    ready: { http: /, timeout: 20 }
+datastores:
+  # A key with capitals: its stand-in namespace is mixed case whatever the
+  # environment id hashes to, so the switch always moves it.
+  Mongo:
+    driver: ${driver}
+    url: "mongodb://127.0.0.1:47017/{{ns}}"
+    presets: [hlt, demo]
+    create: 'mkdir -p "${server}/{{ns}}" && echo {{preset}} > "${server}/{{ns}}/preset"'
+    template_restore: 'cp -r "${server}/{{template}}" "${server}/{{ns}}"'
+    drop: 'rm -rf "${server}/{{ns}}"'
+    list: 'ls -1 "${server}"'
+`;
+    const c = makeCtx({ BACKLOT_SWEEP_MS: '600000' });
+    ctxs.push(c);
+    const wt = c.worktree({ 'runly.yml': manifest('mysql'), 'echo.mjs': ECHO });
+    const first = await c.cli(['up', '--preset', 'Mongo=demo', '--json'], wt);
+    expect(first.code, first.stderr + first.stdout).toBe(0);
+    const oldNs = c.journal().allEnvs()[0]!.datastoreNs.Mongo!;
+    expect(oldNs).toMatch(/[A-Z]/); // the mixed-case name of the stand-in
+    expect(existsSync(join(server, oldNs))).toBe(true);
+
+    // The consumer switches to the real driver and runs `up`.
+    writeFileSync(join(wt, 'runly.yml'), manifest('mongodb'));
+    const moved = await c.cli(['up', '--json'], wt);
+    expect(moved.code, moved.stderr + moved.stdout).toBe(0);
+    const env = c.journal().allEnvs()[0]!;
+    const newNs = env.datastoreNs.Mongo!;
+    expect(newNs).not.toBe(oldNs);
+    expect(newNs).toMatch(/^backlot_[a-z0-9_]+$/);
+    // Restored under the new name, with the preset it held; the service sees it.
+    expect(readFileSync(join(server, newNs, 'preset'), 'utf8').trim()).toBe('demo');
+    expect(((await (await fetch(moved.json.urls.web)).json()) as { preset: string }).preset).toBe(newNs);
+    // The old namespace is gone, and the recorded drop is the new one's.
+    expect(existsSync(join(server, oldNs))).toBe(false);
+    expect(env.dropRecipes?.Mongo?.ns).toBe(newNs);
+
+    // A leftover of this stack in other case (a drop that failed back then)
+    // is runly's for doctor, not foreign, and --fix removes it. Upper case
+    // throughout, so the stack prefix itself differs in case.
+    const leftover = `backlot_${env.stack.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()}_E98_MONGO`;
+    mkdirSync(join(server, leftover));
+    const dry = await c.cli(['pool', 'doctor', '--json'], wt);
+    expect(dry.code, dry.stderr + dry.stdout).toBe(0);
+    const found = (dry.json.findings as Array<{ kind: string; what: string }>).filter((x) => x.kind.endsWith('namespace'));
+    expect(found).toContainEqual(expect.objectContaining({ kind: 'namespace', what: leftover }));
+    const fix = await c.cli(['pool', 'doctor', '--fix', '--json'], wt);
+    expect(fix.code, fix.stderr + fix.stdout).toBe(0);
+    expect(existsSync(join(server, leftover))).toBe(false);
+    expect(existsSync(join(server, newNs))).toBe(true);
+    const destroy = await c.cli(['destroy', '--json'], wt);
+    expect(destroy.code, destroy.stderr + destroy.stdout).toBe(0);
+    expect(readdirSync(server).filter((n) => !n.startsWith('backlot_tpl_'))).toEqual([]);
+  }, 120_000);
+
+  it('a wake that creates a missing source store flushes the store derived from it', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'runly-wake-derived-')));
+    dirs.push(root);
+    const server = join(root, 'server');
+    const es = join(root, 'es');
+    mkdirSync(server);
+    mkdirSync(es);
+    const manifest = (driver: string) => `name: wake-derived
+services:
+  web:
+    run: node echo.mjs
+    port: web
+    idle: 1s
+    env:
+      PORT: "{{ports.web}}"
+    ready: { http: /, timeout: 20 }
+datastores:
+  # Capitals in the key, as above: the switch always moves the namespace.
+  Mongo:
+    driver: ${driver}
+    url: "mongodb://127.0.0.1:47017/{{ns}}"
+    create: 'mkdir -p "${server}/{{ns}}"'
+    drop: 'rm -rf "${server}/{{ns}}"'
+  search:
+    driver: elasticsearch
+    ephemeral: true
+    derived_from: Mongo
+    url: "http://127.0.0.1:49200"
+    drop: 'rm -f "${es}/{{ns}}"-*'
+`;
+    const c = makeCtx({ BACKLOT_SWEEP_MS: '300' });
+    ctxs.push(c);
+    const wt = c.worktree({ 'runly.yml': manifest('mysql'), 'echo.mjs': ECHO });
+    const up = await c.cli(['up', '--json'], wt);
+    expect(up.code, up.stderr + up.stdout).toBe(0);
+    const before = c.journal().allEnvs()[0]!;
+    const searchNs = before.datastoreNs.search!;
+    writeFileSync(join(es, `${searchNs}-vorgang`), 'indexed from the old store');
+    // The service goes idle; then the manifest moves the source store.
+    const idle = async () => {
+      for (let i = 0; i < 100; i++) {
+        if (Object.keys(c.journal().allEnvs()[0]?.servicePids ?? {}).length === 0) return true;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      return false;
+    };
+    expect(await idle()).toBe(true);
+    writeFileSync(join(wt, 'runly.yml'), manifest('mongodb'));
+    // A verb resumes the service the way a connection would wake it.
+    const exec = await c.cli(['exec', '--', 'true'], wt);
+    expect(exec.code, exec.stderr + exec.stdout).toBe(0);
+    const after = c.journal().allEnvs()[0]!;
+    expect(after.datastoreNs.Mongo).not.toBe(before.datastoreNs.Mongo);
+    expect(existsSync(join(server, after.datastoreNs.Mongo!))).toBe(true);
+    expect(existsSync(join(server, before.datastoreNs.Mongo!))).toBe(false);
+    expect(readdirSync(es)).toEqual([]);
+  }, 120_000);
+
+  it("a build sees the preset the restore resolves, also when the held one left the catalog", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'runly-build-preset-')));
+    dirs.push(root);
+    const server = join(root, 'server');
+    mkdirSync(server);
+    const manifest = (presets: string) => `name: build-preset
+services:
+  web:
+    run: node echo.mjs
+    build: 'echo {{datastores.mongo.preset}} > built.txt'
+    port: web
+    env:
+      PORT: "{{ports.web}}"
+      PRESET: "{{datastores.mongo.preset}}"
+    ready: { http: /, timeout: 20 }
+datastores:
+  mongo:
+    driver: mongodb
+    url: "mongodb://127.0.0.1:47017/{{ns}}"
+    presets: [${presets}]
+    create: 'mkdir -p "${server}/{{ns}}" && echo {{preset}} > "${server}/{{ns}}/preset"'
+    drop: 'rm -rf "${server}/{{ns}}"'
+`;
+    const c = makeCtx({ BACKLOT_SWEEP_MS: '600000' });
+    ctxs.push(c);
+    const wt = c.worktree({ 'runly.yml': manifest('hlt, demo'), 'echo.mjs': ECHO });
+    const built = () => readFileSync(join(wt, 'built.txt'), 'utf8').trim();
+    const held = () => readFileSync(join(server, c.journal().allEnvs()[0]!.datastoreNs.mongo!, 'preset'), 'utf8').trim();
+    const demo = await c.cli(['up', '--preset', 'mongo=demo', '--json'], wt);
+    expect(demo.code, demo.stderr + demo.stdout).toBe(0);
+    expect([built(), held()]).toEqual(['demo', 'demo']);
+    // `demo` leaves the catalog: the store is KEPT with what it holds…
+    writeFileSync(join(wt, 'runly.yml'), manifest('hlt'));
+    const kept = await c.cli(['up', '--json'], wt);
+    expect(kept.code, kept.stderr + kept.stdout).toBe(0);
+    expect([built(), held()]).toEqual(['demo', 'demo']);
+    // …and a reset restores the default; the build saw that one too.
+    const reset = await c.cli(['reset-data', '--json'], wt);
+    expect(reset.code, reset.stderr + reset.stdout).toBe(0);
+    expect([built(), held()]).toEqual(['hlt', 'hlt']);
+    expect(((await (await fetch(reset.json.urls.web)).json()) as { preset: string }).preset).toBe('hlt');
+  }, 120_000);
+
   it('refuses an elasticsearch datastore that is not ephemeral, and a derived_from that names nothing', async () => {
     const c = makeCtx();
     ctxs.push(c);
