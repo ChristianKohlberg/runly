@@ -228,4 +228,16 @@ describe('exported resource names', () => {
       expect(() => loadStack(dir, { validate: group !== 'ports' })).toThrow(/web.*WEB.*same exported environment variable/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+
+  it('requires elasticsearch to be ephemeral, without presets or templates, and derived_from to be ephemeral', () => {
+    const m = (ds: Record<string, unknown>) => ({ name: 'x', services: { web: { run: 'true' } }, datastores: { db: { driver: 'mongodb', url: '{{ns}}' }, search: { url: 'http://h', ...ds } } });
+    expect(validate(m({ driver: 'elasticsearch', ephemeral: true, derived_from: 'db' }))).toBe(true);
+    expect(validate(m({ driver: 'elasticsearch' }))).toBe(false);
+    expect(validate(m({ driver: 'elasticsearch', ephemeral: false }))).toBe(false);
+    for (const extra of [{ presets: ['a'] }, { default_preset: 'a' }, { template_restore: 'cp' }]) {
+      expect(validate(m({ driver: 'elasticsearch', ephemeral: true, ...extra }))).toBe(false);
+    }
+    expect(validate(m({ driver: 'redis', derived_from: 'db' }))).toBe(false);
+    expect(validate(m({ driver: 'redis', ephemeral: true, derived_from: 'db' }))).toBe(true);
+  });
 });

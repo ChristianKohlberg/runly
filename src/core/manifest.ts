@@ -358,7 +358,16 @@ export function loadStack(from: string, opts: { validate?: boolean } = {}): Stac
   const file = manifestIn(root);
   if (!file) throw new BrokerError('work-error', `no runly.yml or runly.yaml in ${root}`, 'manifest');
   const manifest = parse(readFileSync(file, 'utf8')) as Manifest;
-  if (opts.validate !== false) validate(manifest);
+  if (opts.validate !== false) {
+    // The schema refuses these too; the engine's own check says why in
+    // words, so it gets the first say — on a manifest it can read at all.
+    try {
+      checkDerivedDatastores(manifest, basename(file));
+    } catch (err) {
+      if (err instanceof BrokerError) throw err;
+    }
+    validate(manifest);
+  }
   // A path that escapes the worktree is refused at load, whether or not an
   // upkeep rule ever makes runly read it: it is never a legitimate source file.
   for (const inc of manifest.sync?.include ?? []) safeJoin(root, inc, 'sync.include');

@@ -450,7 +450,35 @@
           "type": "string",
           "description": "Repo command printing the namespaces ({{ns}} values) of this datastore that exist on its server, one per line. Read only by `runly pool doctor`: a listed name in runly's naming (backlot_...) that no journal row or template marker references is an orphan, which `--fix` drops with `drop:` (decision 0037)."
         }
-      }
+      },
+      "allOf": [
+        {
+          "$comment": "Elasticsearch holds derived search state (decision 0050): ephemeral, no presets, no templates.",
+          "if": {
+            "required": ["driver"],
+            "properties": { "driver": { "const": "elasticsearch" } }
+          },
+          "then": {
+            "required": ["ephemeral"],
+            "properties": { "ephemeral": { "const": true } },
+            "not": {
+              "anyOf": [
+                { "required": ["presets"] },
+                { "required": ["default_preset"] },
+                { "required": ["template_restore"] }
+              ]
+            }
+          }
+        },
+        {
+          "$comment": "Only an ephemeral store is flushed when its source is restored (decision 0050).",
+          "if": { "required": ["derived_from"] },
+          "then": {
+            "required": ["ephemeral"],
+            "properties": { "ephemeral": { "const": true } }
+          }
+        }
+      ]
     },
     "upkeepRule": {
       "type": "object",
