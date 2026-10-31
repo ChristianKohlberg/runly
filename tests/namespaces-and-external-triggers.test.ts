@@ -5,7 +5,7 @@
  */
 import { afterAll, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { makeDatastore, serverNamespace, type DsHandle } from '../src/drivers/datastores.js';
@@ -160,5 +160,56 @@ describe('upkeep triggers outside the worktree', () => {
     expect((await enumerateExternal(wt, ['../big/f1*'], 100)).map((f) => basename(f.path))).toEqual(['f1', 'f10', 'f11', 'f12', 'f13', 'f14', 'f15', 'f16', 'f17', 'f18', 'f19']);
     // A literal file outside the worktree.
     expect((await enumerateExternal(wt, ['../big/f3'])).map((f) => f.path)).toEqual([join(big, 'f3')]);
+  });
+
+  it('follows a symlinked base or intermediate component, and refuses one that really covers the worktree', async () => {
+    const base = mk('runly-ext-');
+    const wt = join(base, 'wt');
+    mkdirSync(wt);
+    const real = mk('runly-ext-real-');
+    mkdirSync(join(real, 'sub'), { recursive: true });
+    writeFileSync(join(real, 'sub', 'export.json'), 'v1');
+    // The base itself is a link: walked in its target, keyed by the path as written.
+    symlinkSync(real, join(base, 'link'));
+    expect((await enumerateExternal(wt, ['../link/**'])).map((f) => f.path)).toEqual([join(base, 'link', 'sub', 'export.json')]);
+    // A link ABOVE the base (an intermediate component).
+    expect((await enumerateExternal(wt, ['../link/sub/*.json'])).map((f) => f.path)).toEqual([join(base, 'link', 'sub', 'export.json')]);
+    // A literal file reached through a link.
+    expect((await enumerateExternal(wt, ['../link/sub/export.json'])).map((f) => f.path)).toEqual([join(base, 'link', 'sub', 'export.json')]);
+    // A link to the worktree's parent, as the base or as an intermediate component, is still refused.
+    const outside = mk('runly-ext-links-');
+    symlinkSync(base, join(outside, 'parent'));
+    symlinkSync(join(base, '..'), join(outside, 'grand'));
+    await expect(enumerateExternal(wt, [`${outside}/parent/**`])).rejects.toThrow(/really '.*' — |contains the worktree/);
+    await expect(enumerateExternal(wt, [`${outside}/grand/${basename(base)}/**`])).rejects.toThrow(/contains the worktree/);
+    symlinkSync('/', join(outside, 'root'));
+    await expect(enumerateExternal(wt, [`${outside}/root/**`])).rejects.toThrow(/filesystem root/);
+    // A dangling link matches nothing.
+    symlinkSync(join(outside, 'nowhere'), join(base, 'dangling'));
+    await expect(enumerateExternal(wt, ['../dangling/**'])).resolves.toEqual([]);
+  });
+});
+
+describe('{{main_worktree}} resolution', () => {
+  it('does not memoize a failed lookup, and resolves a bare repository with linked worktrees', () => {
+    const base = mk('runly-mw-');
+    const repo = join(base, 'repo');
+    mkdirSync(repo);
+    writeFileSync(join(repo, 'a'), 'a');
+    git(repo, 'init', '-q');
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-qm', 'init');
+    // Not a checkout yet: the root stands for itself — and is asked again next time.
+    const later = join(base, 'later');
+    mkdirSync(later);
+    expect(mainWorktreeOf(later)).toBe(later);
+    git(repo, 'worktree', 'add', '-q', later, '-b', 'later');
+    expect(mainWorktreeOf(later)).toBe(repo);
+    // A bare repository (`proj/.bare`) with a linked worktree: its holder.
+    const proj = join(base, 'proj');
+    mkdirSync(proj);
+    execFileSync('git', ['clone', '-q', '--bare', repo, join(proj, '.bare')], { stdio: 'ignore' });
+    git(join(proj, '.bare'), 'worktree', 'add', '-q', join(proj, 'feature'), '-b', 'feature');
+    expect(mainWorktreeOf(join(proj, 'feature'))).toBe(proj);
   });
 });
