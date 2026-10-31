@@ -2025,40 +2025,77 @@ export class Engine {
     const inflight = new Map<string, Promise<void>>();
     // The first start that failed the whole call (not a leased boot failure).
     let fatal: { err: unknown } | undefined;
+    // The call fails: stop what it began — a bind everything (`stop-all`),
+    // a wake only what it started (`stop-these`) — which also ends every
+    // sibling's waitReady at once (the supervisor drops the stopped entry).
+    // Every failure of a launch comes here, wherever it happened: a port
+    // that could not be allocated or a run line that does not template must
+    // not leave its siblings booting until they are ready or time out.
+    const failCall = async (name: string, err: unknown): Promise<never> => {
+      // A sibling already failed the call and stopped this one with the rest.
+      if (fatal) throw err;
+      fatal = { err };
+      if (onFailure === 'stop-these') {
+        try {
+          await this.stopServicesForRestart(env, [...only].filter((n) => n in sup.pids() || n === name));
+        } catch (stopErr) {
+          logEvent({ level: 'warn', kind: 'wake', envId: env.id, detail: `stopping what a failed start began: ${String((stopErr as Error).message ?? stopErr)}` });
+        }
+        throw err;
+      }
+      const survivors = await sup.stopAll();
+      this.supervisors.delete(env.id);
+      const unreaped = await this.reapEnvProcesses(env, survivors);
+      // Same stale-snapshot rule as the epilogue: preserve a concurrent
+      // degrade, and never write back a row that has been recycled away.
+      const live = this.journal.getEnv(env.id);
+      if (live) {
+        live.state = live.state === 'degraded' ? 'degraded' : 'warm';
+        live.servicePids = unreaped;
+        this.journal.saveEnv(live);
+      }
+      throw err;
+    };
     const launch = async (name: string, spec: ServiceSpec): Promise<void> => {
       // The service listens on a fresh INTERNAL port (decision 0033); the
       // proxy keeps the public one and forwards to it once it is ready.
       let internal: number | undefined;
-      if (spec.port) {
-        // The allocation loop at the top of a bind fills every declared
-        // port key, so a miss here is a corrupted port ledger — classify it.
-        if (env.ports[spec.port] === undefined) {
-          throw new BrokerError('env-error', `environment ${env.id} has no port recorded for service '${name}' — the port ledger is inconsistent; try 'runly pool recycle ${env.id}'`, name);
+      let serviceEnv: NodeJS.ProcessEnv = {};
+      let url: string | undefined;
+      try {
+        if (spec.port) {
+          // The allocation loop at the top of a bind fills every declared
+          // port key, so a miss here is a corrupted port ledger — classify it.
+          if (env.ports[spec.port] === undefined) {
+            throw new BrokerError('env-error', `environment ${env.id} has no port recorded for service '${name}' — the port ledger is inconsistent; try 'runly pool recycle ${env.id}'`, name);
+          }
+          internal = await this.allocInternalPort(internalTaken, env.id, spec.port);
+          internalTaken.add(internal);
+          // A sibling's start failed while this one allocated: the call is
+          // stopping what it began, so this one must not begin at all.
+          if (fatal) throw fatal.err;
+          this.proxy.starting(env.id, spec.port, name);
         }
-        internal = await this.allocInternalPort(internalTaken, env.id, spec.port);
-        internalTaken.add(internal);
-        // A sibling's start failed while this one allocated: the call is
-        // stopping what it began, so this one must not begin at all.
-        if (fatal) throw fatal.err;
-        this.proxy.starting(env.id, spec.port, name);
+        const ctx = this.templateCtx(stack, env, spec.port && internal !== undefined ? { key: spec.port, port: internal } : undefined);
+        // Template the COMMANDS too — ports/urls may ride in the run line itself
+        // (e.g. `ng serve --port {{ports.web}}`), not only in env:.
+        const resolved = { ...spec, run: template(spec.run, ctx) };
+        const callerValues = serviceCallerEnv(spec, inputs.values);
+        serviceEnv = { ...templateEnv(spec.env, ctx), ...callerValues };
+        this.failedServices.delete(`${env.id}\0${name}`);
+        sup.start(name, resolved, serviceEnv, Object.values(callerValues).filter((value): value is string => value !== undefined));
+        // From now on the running service is what the budget counts; its share
+        // leaves the reservation (it was counted twice until the bind ended).
+        reservation?.consume(costsOf(spec.resources, policy().budget).run);
+        // A fresh start is activity: an old idle clock must not stop it at once.
+        this.startedAt.set(`${env.id}\0${name}`, now());
+        this.idleStopped.delete(`${env.id}\0${name}`);
+        // Readiness goes to the internal port, past the proxy: runly's own
+        // probes are never client activity.
+        url = internal !== undefined ? `http://localhost:${internal}` : undefined;
+      } catch (err) {
+        return failCall(name, err);
       }
-      const ctx = this.templateCtx(stack, env, spec.port && internal !== undefined ? { key: spec.port, port: internal } : undefined);
-      // Template the COMMANDS too — ports/urls may ride in the run line itself
-      // (e.g. `ng serve --port {{ports.web}}`), not only in env:.
-      const resolved = { ...spec, run: template(spec.run, ctx) };
-      const callerValues = serviceCallerEnv(spec, inputs.values);
-      const serviceEnv = { ...templateEnv(spec.env, ctx), ...callerValues };
-      this.failedServices.delete(`${env.id}\0${name}`);
-      sup.start(name, resolved, serviceEnv, Object.values(callerValues).filter((value): value is string => value !== undefined));
-      // From now on the running service is what the budget counts; its share
-      // leaves the reservation (it was counted twice until the bind ended).
-      reservation?.consume(costsOf(spec.resources, policy().budget).run);
-      // A fresh start is activity: an old idle clock must not stop it at once.
-      this.startedAt.set(`${env.id}\0${name}`, now());
-      this.idleStopped.delete(`${env.id}\0${name}`);
-      // Readiness goes to the internal port, past the proxy: runly's own
-      // probes are never client activity.
-      const url = internal !== undefined ? `http://localhost:${internal}` : undefined;
       say(`starting '${name}', waiting until ready`);
       const readyStart = now();
       const beat = setInterval(() => say(`waiting for '${name}' … ${Math.round((now() - readyStart) / 1000)}s`), 3000);
@@ -2077,16 +2114,7 @@ export class Engine {
         clearInterval(beat);
         // A sibling already failed the call and stopped this one with the rest.
         if (fatal) throw err;
-        if (onFailure === 'stop-these') {
-          fatal = { err };
-          try {
-            await this.stopServicesForRestart(env, [...only].filter((n) => n in sup.pids() || n === name));
-          } catch (stopErr) {
-            logEvent({ level: 'warn', kind: 'wake', envId: env.id, detail: `stopping what a failed start began: ${String((stopErr as Error).message ?? stopErr)}` });
-          }
-          throw err;
-        }
-        if (err instanceof BrokerError && err.klass === 'work-error' && err.source === name && this.journal.leaseForEnv(env.id)) {
+        if (onFailure === 'stop-all' && err instanceof BrokerError && err.klass === 'work-error' && err.source === name && this.journal.leaseForEnv(env.id)) {
           try {
             // The crash loop may have reported it already (onDegraded).
             if (!this.failureOf(env.id, name)) {
@@ -2099,20 +2127,7 @@ export class Engine {
             logEvent({ level: 'warn', kind: 'service-failed', envId: env.id, detail: `stopping '${name}' after its failed boot: ${String((stopErr as Error).message ?? stopErr)} — stopping the bind` });
           }
         }
-        if (fatal) throw err;
-        fatal = { err };
-        const survivors = await sup.stopAll();
-        this.supervisors.delete(env.id);
-        const unreaped = await this.reapEnvProcesses(env, survivors);
-        // Same stale-snapshot rule as the epilogue: preserve a concurrent
-        // degrade, and never write back a row that has been recycled away.
-        const live = this.journal.getEnv(env.id);
-        if (live) {
-          live.state = live.state === 'degraded' ? 'degraded' : 'warm';
-          live.servicePids = unreaped;
-          this.journal.saveEnv(live);
-        }
-        throw err;
+        return failCall(name, err);
       }
       started.add(name);
     };

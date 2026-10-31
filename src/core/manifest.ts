@@ -365,6 +365,7 @@ export function loadStack(from: string, opts: { validate?: boolean } = {}): Stac
   checkCopiesOnly(manifest, basename(file));
   checkDatastoreNamespaces(manifest);
   checkDerivedDatastores(manifest, basename(file));
+  checkTemplateVariables(manifest, basename(file));
   checkExportNames(manifest);
   // Identity = absolute root + declared name; filesystem-safe. Hash the WHOLE
   // path: slicing base64url(root) kept only the last ~6 bytes, so sibling
@@ -443,6 +444,48 @@ function checkDerivedDatastores(manifest: Manifest, file: string): void {
       throw new BrokerError('work-error', `datastore '${name}' declares derived_from in ${file} but is not 'ephemeral: true' (or is copies_only): only an ephemeral store is flushed when its source is restored`, 'manifest');
     }
   }
+}
+
+/** The `{{…}}` syntax `template()` (util.ts) resolves. */
+const TEMPLATE_VAR = /\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g;
+
+/**
+ * Every `{{…}}` in a templated field — a service's `run:`, `build:` command
+ * and `env:` values, and `auth.token` — must name a variable the environment
+ * has (docs/manifest.md): a declared port, a service with a port, a
+ * datastore an environment provisions, `env.id`/`env.slug`, and `{{role}}`
+ * in `auth.token`. A typo used to surface only when the service started —
+ * after its siblings were already booting.
+ */
+function checkTemplateVariables(manifest: Manifest, file: string): void {
+  const known = new Set<string>(['env.id', 'env.slug']);
+  for (const [svc, spec] of Object.entries(manifest.services ?? {})) {
+    if (!spec.port) continue;
+    known.add(`ports.${spec.port}`);
+    known.add(`public_ports.${spec.port}`);
+    known.add(`services.${svc}.url`);
+  }
+  for (const [ds, spec] of Object.entries(manifest.datastores ?? {})) {
+    if (spec.copies_only === true) continue;
+    for (const leaf of ['url', 'ns', 'preset']) known.add(`datastores.${ds}.${leaf}`);
+  }
+  const check = (where: string, text: unknown, extra: string[] = []) => {
+    if (typeof text !== 'string') return;
+    for (const m of text.matchAll(TEMPLATE_VAR)) {
+      const name = m[1]!;
+      if (known.has(name) || extra.includes(name)) continue;
+      const group = name.split('.')[0]!;
+      const sameGroup = [...known, ...extra].filter((k) => k.split('.')[0] === group);
+      const hint = sameGroup.length > 0 ? `; known here: ${sameGroup.map((k) => `{{${k}}}`).join(', ')}` : '; see the template variables in docs/manifest.md';
+      throw new BrokerError('work-error', `${where} in ${file} uses {{${name}}}, which is not a template variable${hint}`, 'manifest');
+    }
+  };
+  for (const [svc, spec] of Object.entries(manifest.services ?? {})) {
+    check(`service '${svc}' run:`, spec.run);
+    check(`service '${svc}' build:`, buildOf(spec)?.run);
+    for (const [k, v] of Object.entries(spec.env ?? {})) check(`service '${svc}' env ${k}`, v);
+  }
+  check('auth.token', manifest.auth?.token, ['role']);
 }
 
 /** The datastores derived from `source` (decision 0050). */
