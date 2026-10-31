@@ -1,6 +1,6 @@
 # 0034. `up` is additive and `down` stops what it names; a preset reloads one datastore; a database alone is a `runly db` copy; `runly ps` shows both
 
-- Status: Environment lifetime amended by [0046](0046-worktree-owned-activity-lifecycle.md); standalone copy lifetime remains separate.
+- Status: Environment lifetime amended by [0046](0046-worktree-owned-activity-lifecycle.md); standalone copy lifetime remains separate; what a preset reload restores amended by [0050](0050-mongodb-elasticsearch-derived-datastores.md): a store `derived_from` the reloaded one is flushed with it.
 - Date: 2026-10
 - Supersedes: [0023](0023-data-only-leases.md) (`up --data-only`) and
   [0025](0025-data-only-environments-are-priced-separately.md) (the data-only

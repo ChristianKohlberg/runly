@@ -1,6 +1,6 @@
 # 0037. Teardown carries its own drop recipes; templates are collected by reference; `runly pool doctor` finds what was left behind
 
-- Status: Accepted
+- Status: Accepted — template retention amended by [0044](0044-content-keyed-templates-are-shared-across-worktrees.md); how `pool doctor` reads namespaces amended by [0050](0050-mongodb-elasticsearch-derived-datastores.md): case-folding drivers compared without case, Elasticsearch index names reduced to their prefix.
 - Date: 2026-10
 - Amends: [0032](0032-environments-run-in-the-callers-worktree.md) —
   `templatesKeep` counts per datastore and preset, not per stack

@@ -271,6 +271,11 @@ export class EnvSupervisor {
     if (!running) throw new BrokerError('env-error', `service '${name}' was never started`, name);
 
     for (;;) {
+      // Stopped (or replaced) while it booted — a sibling's failed start
+      // stopped the bind's services: waiting out ready.timeout helps no one.
+      if (this.services.get(name) !== running) {
+        throw new BrokerError('env-error', `service '${name}' was stopped before it became ready`, name, tail(running.buf));
+      }
       const buf = running.buf;
       if (fatal && fatal.test(running.probeBuf)) {
         throw new BrokerError('work-error', `service '${name}' hit a fatal log marker during boot`, name, tail(buf));

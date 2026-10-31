@@ -6,10 +6,10 @@ import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync } from 'node:f
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, NO_LEASE_EXPIRY, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow, type PreviewRestore } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { buildOf, canonicalDirectory, findStackRoot, envDatastoreNames, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
+import { CASE_FOLDING_DRIVERS, buildOf, canonicalDirectory, defaultPreset, derivedDatastores, findStackRoot, envDatastoreNames, type DatastoreSpec, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
 import { forgetNamespace, recordedNamespaces } from '../core/namespaces.js';
-import { runlyEnvVars } from '../core/env-vars.js';
+import { envSlug, runlyEnvVars } from '../core/env-vars.js';
 import { buildInputsKey, buildIsCurrent, clearBuilds, everBuilt, forgetBuild, recordBuild } from '../core/builds.js';
 import { LogWriter, UPKEEP_LOG, beginBuildLog, buildLogOf, logFileOf, readLog } from '../core/logs.js';
 import { formatDuration, parseDuration } from '../core/units.js';
@@ -131,6 +131,28 @@ class ServiceFailure extends BrokerError {}
  * an agent that crashed kept its environment until the TTL expired. A pid plus
  * its start time can be checked cheaply and survives pid reuse.
  */
+/**
+ * `{{datastores.<ds>.preset}}` (decision 0050): the preset the datastore holds
+ * — or, while a bind is about to restore a named one, that preset. Before the
+ * first restore it is the preset the first restore will use.
+ */
+function templatePreset(name: string, spec: DatastoreSpec, held: string | undefined): string {
+  // A store that is KEPT holds `held` even when the catalog dropped it
+  // (decision 0034), and ctx reports the same; a bind that restores a store
+  // passes the preset the restore resolves (`presetToRestore`) as `held`.
+  if (held !== undefined) return held;
+  try {
+    return presetToRestore(name, spec, undefined);
+  } catch {
+    return defaultPreset(spec);
+  }
+}
+
+/** `names` plus every datastore derived from one of them (decision 0050). */
+function withDerived(manifest: Manifest, names: string[]): string[] {
+  return [...new Set([...names, ...names.flatMap((n) => derivedDatastores(manifest, n))])];
+}
+
 /** A datastore's template scope in this stack (decision 0044): its bake key, shared per manifest name. */
 function templateScope(stack: Stack, bakeKeys: Record<string, string>, name: string, privateBake = false): TemplateScope {
   return { bakeKey: bakeKeys[name], project: stack.manifest.name, ...(privateBake ? { privateBake } : {}) };
@@ -919,22 +941,24 @@ export class Engine {
    * service must listen on. `{{public_ports.<key>}}` is always the public one,
    * for a service that has to advertise its own address.
    */
-  private templateCtx(stack: Stack, env: EnvRow, own?: { key: string; port: number }) {
+  private templateCtx(stack: Stack, env: EnvRow, own?: { key: string; port: number }, upcoming: Record<string, string> = {}) {
     const services: Record<string, { url: string }> = {};
     for (const [name, spec] of Object.entries(stack.manifest.services)) {
       if (spec.port) services[name] = { url: `http://localhost:${env.ports[spec.port]}` };
     }
     const ports = own ? { ...env.ports, [own.key]: own.port } : env.ports;
-    const datastores: Record<string, { url: string; ns: string }> = {};
+    const datastores: Record<string, { url: string; ns: string; preset: string }> = {};
     const dirs = this.envDirs(env.id);
     const h: DsHandle = { envId: env.id, cwd: env.stackRoot, dataDir: dirs.data };
     for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
       // A copies_only datastore (decision 0039) has no namespace in an environment.
       if (spec.copies_only === true) continue;
       const ds = makeDatastore(name, spec, stack.id);
-      datastores[name] = { url: ds.url(h), ns: ds.ns(h) };
+      datastores[name] = { url: ds.url(h), ns: ds.ns(h), preset: templatePreset(name, spec, upcoming[name] ?? env.presets[name]) };
     }
-    return { ports, public_ports: env.ports, services, datastores };
+    // `{{env.id}}` / `{{env.slug}}` (decision 0050): stable for the
+    // environment's life; the slug is the lowercase, DNS-label-safe form.
+    return { ports, public_ports: env.ports, services, datastores, env: { id: env.id, slug: envSlug(env.id) } };
   }
 
   private supervisor(env: EnvRow): EnvSupervisor {
@@ -1089,6 +1113,52 @@ export class Engine {
   }
 
   /**
+   * The namespace datastore `name` has in `env` under the CURRENT manifest.
+   * A recorded namespace that differs is a store the manifest has moved away
+   * from (H1: a driver switch changes the name), not an existing one.
+   */
+  private currentNs(stack: Stack, env: EnvRow, name: string): string | undefined {
+    const spec = stack.manifest.datastores?.[name];
+    if (!spec || spec.copies_only === true) return undefined;
+    return makeDatastore(name, spec, stack.id).ns({ envId: env.id, cwd: stack.root, dataDir: this.envDirs(env.id).data });
+  }
+
+  /** Does the environment hold datastore `name` under its current namespace? */
+  private holdsDatastore(stack: Stack, env: EnvRow, name: string): boolean {
+    const ns = env.datastoreNs[name];
+    return ns !== undefined && ns === this.currentNs(stack, env, name);
+  }
+
+  /**
+   * Give back a datastore's OLD namespace — recorded under a name the
+   * current manifest no longer gives it — by the drop recorded for it
+   * (decision 0037), before anything overwrites that record. A drop that
+   * fails is logged, and the name stays findable by `pool doctor` (it is
+   * runly's naming, of a known stack); the store is restored either way.
+   */
+  private async retireMovedNamespace(stack: Stack, env: EnvRow, name: string, oldNs: string, newNs: string, say: Progress): Promise<void> {
+    const recipe = env.dropRecipes?.[name];
+    say(`datastore '${name}' moved from ${oldNs} to ${newNs}: dropping the old namespace`);
+    try {
+      if (!recipe || (recipe.ns !== undefined && recipe.ns !== oldNs)) throw new Error('no drop is recorded for the old namespace');
+      await measureMetric('datastore.drop_ms', { stack: stack.id, envId: env.id, datastore: name, reason: 'moved' }, () => this.runDropRecipe(recipe, recipe.cwd && existsSync(recipe.cwd) ? recipe.cwd : stack.root));
+      logEvent({ level: 'info', kind: 'datastore', envId: env.id, detail: `datastore '${name}' moved from ${oldNs} to ${newNs} (its manifest entry changed): the old namespace was dropped` });
+    } catch (err) {
+      logEvent({ level: 'warn', kind: 'datastore', envId: env.id, detail: `datastore '${name}' moved from ${oldNs} to ${newNs}, but the old namespace was NOT dropped — 'runly pool doctor --fix' can drop it: ${String((err as Error).message ?? err)}` });
+    }
+    delete env.datastoreNs[name];
+    if (env.templates) delete env.templates[name];
+    if (env.dropRecipes) delete env.dropRecipes[name];
+    const live = this.journal.getEnv(env.id);
+    if (live) {
+      delete live.datastoreNs[name];
+      if (live.templates) delete live.templates[name];
+      if (live.dropRecipes) delete live.dropRecipes[name];
+      this.journal.saveEnv(live);
+    }
+  }
+
+  /**
    * Create, keep or reload each datastore in `plan` — all of them at once
    * (0.19): each bakes and restores under its own datastore lock, so three
    * datastores cost the slowest one, not their sum. Every completed restore is
@@ -1114,7 +1184,15 @@ export class Engine {
       const ds = makeDatastore(step.name, spec, stack.id, templateScope(stack, bakeKeys, step.name, privateBakes.has(step.name)));
       await ds.probe();
       const held = env.presets[step.name];
-      const exists = Boolean(env.datastoreNs[step.name]);
+      // The store EXISTS only under the name the current manifest gives it.
+      // A recorded namespace with another name (the driver changed, say
+      // `mysql` → `mongodb`, whose names are lowercase) is the old store:
+      // it is dropped by its recorded recipe BEFORE the new recipe replaces
+      // that record, and the store is restored under its new name.
+      const nsNow = ds.ns(dsHandle);
+      const recorded = env.datastoreNs[step.name];
+      if (recorded !== undefined && recorded !== nsNow) await this.retireMovedNamespace(stack, env, step.name, recorded, nsNow, say);
+      const exists = env.datastoreNs[step.name] === nsNow;
       const preset = step.preset ?? presetToRestore(step.name, spec, held);
       const restores = step.force || !exists;
       if (restores) say(`preparing datastore '${step.name}' (${preset})`);
@@ -1124,7 +1202,7 @@ export class Engine {
       env.dropRecipes = { ...(env.dropRecipes ?? {}), [step.name]: ds.dropRecipe(dsHandle) };
       this.journal.saveEnv({ ...(this.journal.getEnv(env.id) ?? env), dropRecipes: env.dropRecipes });
       await ds.ensure(dsHandle, preset, step.force, exists);
-      env.datastoreNs[step.name] = ds.ns(dsHandle);
+      env.datastoreNs[step.name] = nsNow;
       // A kept store still holds what it held; only a restore changes that.
       env.presets[step.name] = restores || held === undefined ? preset : held;
       if (restores) {
@@ -1403,7 +1481,7 @@ export class Engine {
 
     if (keepRunning) {
       trace.phase('build');
-      const buildCtx = this.templateCtx(stack, env);
+      const buildCtx = this.templateCtx(stack, env, undefined, reloadPresets);
       const toRestart = new Set<string>();
       await this.treeLocked(stack.id, () => this.inWaves(this.buildWaves(stack, active), async (name) => {
         const spec = serviceOf(stack, name);
@@ -1443,7 +1521,8 @@ export class Engine {
       // running services that use it stop first and start again on the new
       // data. Who uses it is read from the manifest; if nothing references it,
       // nobody can tell, so every running service restarts.
-      const reloads = Object.keys(reloadPresets);
+      // A derived datastore (decision 0050) is flushed with its source.
+      const reloads = withDerived(stack.manifest, Object.keys(reloadPresets));
       for (const ds of reloads) {
         const users = this.datastoreUsers(stack, ds);
         for (const name of running) if (users === null || users.has(name)) toRestart.add(name);
@@ -1503,14 +1582,17 @@ export class Engine {
     // restored (or baked) while the services build, and the services start
     // only once both are done. A build's templates may name a datastore's url
     // or ns — both are derived from the environment, not from the restore.
+    // A datastore derived from one that is restored here (created, reset,
+    // reloaded, re-restored for a new template) is flushed too (decision 0050).
+    const forced = (name: string): boolean => reloadPresets[name] !== undefined || hygiene !== 'reuse' || staleTemplate(name);
+    const restoring = (name: string): boolean => forced(name) || !this.holdsDatastore(stack, env, name);
     const data = async () => {
       const t0 = performance.now();
       try {
-        await this.prepareDatastores(stack, env, bakeKeys, this.envDatastores(stack).map((name) => ({
-          name,
-          force: reloadPresets[name] !== undefined || hygiene !== 'reuse' || staleTemplate(name),
-          preset: reloadPresets[name],
-        })), say, privateBakes);
+        await this.prepareDatastores(stack, env, bakeKeys, this.envDatastores(stack).map((name) => {
+          const source = stack.manifest.datastores?.[name]?.derived_from;
+          return { name, force: forced(name) || (source !== undefined && restoring(source)), preset: reloadPresets[name] };
+        }), say, privateBakes);
       } finally {
         phaseMs.data = performance.now() - t0;
       }
@@ -1520,7 +1602,15 @@ export class Engine {
     // last successful build (decision 0038). runly keeps no build cache —
     // MSBuild, pnpm and the Angular CLI decide what is already up to date.
     // Under the worktree lock: `runly warm` builds into the same output.
-    const ctx = this.templateCtx(stack, env);
+    // A build runs before (next to) the restore, so it sees the preset each
+    // store is ABOUT to hold — resolved exactly as prepareDatastores resolves
+    // it — and the held one for a store that is kept.
+    const upcoming: Record<string, string> = {};
+    for (const name of this.envDatastores(stack)) {
+      const spec = stack.manifest.datastores?.[name];
+      if (spec && restoring(name)) upcoming[name] = reloadPresets[name] ?? presetToRestore(name, spec, env.presets[name]);
+    }
+    const ctx = this.templateCtx(stack, env, undefined, upcoming);
     const builds = async () => {
       const t0 = performance.now();
       try {
@@ -1904,7 +1994,8 @@ export class Engine {
 
   /**
    * Start `only` (a subset of `active`) in dependency order, readiness-gated,
-   * fatal-log fast-fail. The other members of `active` are already running,
+   * fatal-log fast-fail: each service as soon as its own depends_on are
+   * ready, concurrently with every other one that is. The other members of `active` are already running,
    * so they count as started for depends_on — and so does a dependency the
    * lease took `down` on purpose (it is not wanted; the dependent reaches its
    * stable public port). On a failure a bind stops everything (`stop-all`); a
@@ -1926,26 +2017,52 @@ export class Engine {
     const entries = Object.entries(stack.manifest.services).filter(([n]) => only.has(n));
     const failed = new Set<string>();
     const blocked = new Set<string>();
-    for (;;) {
-      // A service that depends on a failed (or itself blocked) one is not started.
-      for (let grew = true; grew;) {
-        grew = false;
-        for (const [n, s] of entries) {
-          if (started.has(n) || failed.has(n) || blocked.has(n)) continue;
-          if ((s.depends_on ?? []).some((d) => failed.has(d) || blocked.has(d))) {
-            blocked.add(n);
-            grew = true;
-          }
+    // Each service starts as soon as ITS depends_on are ready, and the starts
+    // run at once: a slow service (a sync that indexes for minutes before it
+    // logs ready) never holds back one that does not depend on it. Starting
+    // the ready ones one after another, readiness-gated, made every later
+    // service wait for every earlier one of the same round.
+    const inflight = new Map<string, Promise<void>>();
+    // The first start that failed the whole call (not a leased boot failure).
+    let fatal: { err: unknown } | undefined;
+    // The call fails: stop what it began — a bind everything (`stop-all`),
+    // a wake only what it started (`stop-these`) — which also ends every
+    // sibling's waitReady at once (the supervisor drops the stopped entry).
+    // Every failure of a launch comes here, wherever it happened: a port
+    // that could not be allocated or a run line that does not template must
+    // not leave its siblings booting until they are ready or time out.
+    const failCall = async (name: string, err: unknown): Promise<never> => {
+      // A sibling already failed the call and stopped this one with the rest.
+      if (fatal) throw err;
+      fatal = { err };
+      if (onFailure === 'stop-these') {
+        try {
+          await this.stopServicesForRestart(env, [...only].filter((n) => n in sup.pids() || n === name));
+        } catch (stopErr) {
+          logEvent({ level: 'warn', kind: 'wake', envId: env.id, detail: `stopping what a failed start began: ${String((stopErr as Error).message ?? stopErr)}` });
         }
+        throw err;
       }
-      const pending = entries.filter(([n]) => !started.has(n) && !failed.has(n) && !blocked.has(n));
-      if (pending.length === 0) break;
-      const ready = pending.filter(([, s]) => (s.depends_on ?? []).every((d) => started.has(d) || !active.has(d)));
-      if (ready.length === 0) throw new BrokerError('work-error', `depends_on cycle in ${manifestFileOf(stack)}`, 'manifest');
-      for (const [name, spec] of ready) {
-        // The service listens on a fresh INTERNAL port (decision 0033); the
-        // proxy keeps the public one and forwards to it once it is ready.
-        let internal: number | undefined;
+      const survivors = await sup.stopAll();
+      this.supervisors.delete(env.id);
+      const unreaped = await this.reapEnvProcesses(env, survivors);
+      // Same stale-snapshot rule as the epilogue: preserve a concurrent
+      // degrade, and never write back a row that has been recycled away.
+      const live = this.journal.getEnv(env.id);
+      if (live) {
+        live.state = live.state === 'degraded' ? 'degraded' : 'warm';
+        live.servicePids = unreaped;
+        this.journal.saveEnv(live);
+      }
+      throw err;
+    };
+    const launch = async (name: string, spec: ServiceSpec): Promise<void> => {
+      // The service listens on a fresh INTERNAL port (decision 0033); the
+      // proxy keeps the public one and forwards to it once it is ready.
+      let internal: number | undefined;
+      let serviceEnv: NodeJS.ProcessEnv = {};
+      let url: string | undefined;
+      try {
         if (spec.port) {
           // The allocation loop at the top of a bind fills every declared
           // port key, so a miss here is a corrupted port ledger — classify it.
@@ -1954,6 +2071,9 @@ export class Engine {
           }
           internal = await this.allocInternalPort(internalTaken, env.id, spec.port);
           internalTaken.add(internal);
+          // A sibling's start failed while this one allocated: the call is
+          // stopping what it began, so this one must not begin at all.
+          if (fatal) throw fatal.err;
           this.proxy.starting(env.id, spec.port, name);
         }
         const ctx = this.templateCtx(stack, env, spec.port && internal !== undefined ? { key: spec.port, port: internal } : undefined);
@@ -1961,7 +2081,7 @@ export class Engine {
         // (e.g. `ng serve --port {{ports.web}}`), not only in env:.
         const resolved = { ...spec, run: template(spec.run, ctx) };
         const callerValues = serviceCallerEnv(spec, inputs.values);
-        const serviceEnv = { ...templateEnv(spec.env, ctx), ...callerValues };
+        serviceEnv = { ...templateEnv(spec.env, ctx), ...callerValues };
         this.failedServices.delete(`${env.id}\0${name}`);
         sup.start(name, resolved, serviceEnv, Object.values(callerValues).filter((value): value is string => value !== undefined));
         // From now on the running service is what the budget counts; its share
@@ -1972,59 +2092,74 @@ export class Engine {
         this.idleStopped.delete(`${env.id}\0${name}`);
         // Readiness goes to the internal port, past the proxy: runly's own
         // probes are never client activity.
-        const url = internal !== undefined ? `http://localhost:${internal}` : undefined;
-        say(`starting '${name}', waiting until ready`);
-        const readyStart = now();
-        const beat = setInterval(() => say(`waiting for '${name}' … ${Math.round((now() - readyStart) / 1000)}s`), 3000);
-        beat.unref();
-        try {
-          await measureMetric('service.ready_ms', { stack: stack.id, envId: env.id, service: name }, () => sup.waitReady(name, spec, url, serviceEnv));
-          clearInterval(beat);
-          if (spec.port && internal !== undefined) this.proxy.up(env.id, spec.port, internal, name);
-          const idleAt = this.idleStoppedAt.get(`${env.id}\0${name}`);
-          if (idleAt !== undefined) {
-            recordMetric('service.idle_until_ready_ms', Math.max(0, now() - idleAt), { stack: stack.id, envId: env.id, service: name });
-            this.idleStoppedAt.delete(`${env.id}\0${name}`);
-          }
-          say(`'${name}' ready`);
-        } catch (err) {
-          clearInterval(beat);
-          if (onFailure === 'stop-these') {
-            try {
-              await this.stopServicesForRestart(env, [...only].filter((n) => n in sup.pids() || n === name));
-            } catch (stopErr) {
-              logEvent({ level: 'warn', kind: 'wake', envId: env.id, detail: `stopping what a failed start began: ${String((stopErr as Error).message ?? stopErr)}` });
-            }
-            throw err;
-          }
-          if (err instanceof BrokerError && err.klass === 'work-error' && err.source === name && this.journal.leaseForEnv(env.id)) {
-            try {
-              // The crash loop may have reported it already (onDegraded).
-              if (!this.failureOf(env.id, name)) {
-                this.serviceFailed(env.id, name, { code: sup.exitCodeOf(name), signal: null, reason: 'boot-failed', detail: err.message.replace(/^service '[^']*' /, '') });
-              }
-              await this.stopServicesForRestart(env, [name]);
-              failed.add(name);
-              continue;
-            } catch (stopErr) {
-              logEvent({ level: 'warn', kind: 'service-failed', envId: env.id, detail: `stopping '${name}' after its failed boot: ${String((stopErr as Error).message ?? stopErr)} — stopping the bind` });
-            }
-          }
-          const survivors = await sup.stopAll();
-          this.supervisors.delete(env.id);
-          const unreaped = await this.reapEnvProcesses(env, survivors);
-          // Same stale-snapshot rule as the epilogue: preserve a concurrent
-          // degrade, and never write back a row that has been recycled away.
-          const live = this.journal.getEnv(env.id);
-          if (live) {
-            live.state = live.state === 'degraded' ? 'degraded' : 'warm';
-            live.servicePids = unreaped;
-            this.journal.saveEnv(live);
-          }
-          throw err;
-        }
-        started.add(name);
+        url = internal !== undefined ? `http://localhost:${internal}` : undefined;
+      } catch (err) {
+        return failCall(name, err);
       }
+      say(`starting '${name}', waiting until ready`);
+      const readyStart = now();
+      const beat = setInterval(() => say(`waiting for '${name}' … ${Math.round((now() - readyStart) / 1000)}s`), 3000);
+      beat.unref();
+      try {
+        await measureMetric('service.ready_ms', { stack: stack.id, envId: env.id, service: name }, () => sup.waitReady(name, spec, url, serviceEnv));
+        clearInterval(beat);
+        if (spec.port && internal !== undefined) this.proxy.up(env.id, spec.port, internal, name);
+        const idleAt = this.idleStoppedAt.get(`${env.id}\0${name}`);
+        if (idleAt !== undefined) {
+          recordMetric('service.idle_until_ready_ms', Math.max(0, now() - idleAt), { stack: stack.id, envId: env.id, service: name });
+          this.idleStoppedAt.delete(`${env.id}\0${name}`);
+        }
+        say(`'${name}' ready`);
+      } catch (err) {
+        clearInterval(beat);
+        // A sibling already failed the call and stopped this one with the rest.
+        if (fatal) throw err;
+        if (onFailure === 'stop-all' && err instanceof BrokerError && err.klass === 'work-error' && err.source === name && this.journal.leaseForEnv(env.id)) {
+          try {
+            // The crash loop may have reported it already (onDegraded).
+            if (!this.failureOf(env.id, name)) {
+              this.serviceFailed(env.id, name, { code: sup.exitCodeOf(name), signal: null, reason: 'boot-failed', detail: err.message.replace(/^service '[^']*' /, '') });
+            }
+            await this.stopServicesForRestart(env, [name]);
+            failed.add(name);
+            return;
+          } catch (stopErr) {
+            logEvent({ level: 'warn', kind: 'service-failed', envId: env.id, detail: `stopping '${name}' after its failed boot: ${String((stopErr as Error).message ?? stopErr)} — stopping the bind` });
+          }
+        }
+        return failCall(name, err);
+      }
+      started.add(name);
+    };
+    for (;;) {
+      // A service that depends on a failed (or itself blocked) one is not started.
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const [n, s] of entries) {
+          if (started.has(n) || failed.has(n) || blocked.has(n) || inflight.has(n)) continue;
+          if ((s.depends_on ?? []).some((d) => failed.has(d) || blocked.has(d))) {
+            blocked.add(n);
+            grew = true;
+          }
+        }
+      }
+      const pending = entries.filter(([n]) => !started.has(n) && !failed.has(n) && !blocked.has(n) && !inflight.has(n));
+      if (!fatal) {
+        for (const [name, spec] of pending) {
+          if (!(spec.depends_on ?? []).every((d) => started.has(d) || !active.has(d))) continue;
+          // Errors are read from `fatal` once everything in flight settled:
+          // nothing is left starting behind the caller's back.
+          inflight.set(name, launch(name, spec).catch((err: unknown) => {
+            if (!fatal) fatal = { err };
+          }).finally(() => inflight.delete(name)));
+        }
+      }
+      if (inflight.size === 0) {
+        if (fatal) throw fatal.err;
+        if (pending.length === 0) break;
+        throw new BrokerError('work-error', `depends_on cycle in ${manifestFileOf(stack)}`, 'manifest');
+      }
+      await Promise.race(inflight.values());
     }
     for (const n of blocked) {
       const key = stack.manifest.services[n]?.port;
@@ -3712,10 +3847,16 @@ export class Engine {
     // A namespace cut to 63 bytes may have lost its stack id: those are
     // recorded with their stack when they are created (W4).
     const recorded = recordedNamespaces();
-    const ownerOf = (ns: string): string | undefined => {
+    // A case-folding driver's names (mongodb, elasticsearch — decision 0050)
+    // are the lowercase form of the same prefixes — and its server may still
+    // hold MIXED-case names from before the datastore switched to it (a
+    // `driver: mysql` stand-in for MongoDB): both are compared without case.
+    // An exact match wins, so case folding never moves a name to another stack.
+    const startsWith = (ns: string, p: string, fold: boolean) => (fold ? ns.toLowerCase().startsWith(p.toLowerCase()) : ns.startsWith(p));
+    const ownerOf = (ns: string, fold: boolean): string | undefined => {
       const rec = recorded.get(ns);
       if (rec !== undefined) return rec;
-      return [...knownStacks].find((id) => prefixesOf(id).some((p) => ns.startsWith(p)));
+      return [...knownStacks].find((id) => prefixesOf(id).some((p) => ns.startsWith(p))) ?? [...knownStacks].find((id) => prefixesOf(id).some((p) => startsWith(ns, p, fold)));
     };
     // In flight: a bind (busy env) or a copy being created or dropped. Their
     // namespaces are referenced above already; this also covers a row a
@@ -3725,15 +3866,22 @@ export class Engine {
       const spec = st.manifest.datastores?.[ds];
       if (!spec?.list || !spec.drop) continue;
       const drop = spec.drop;
+      const fold = CASE_FOLDING_DRIVERS.has(spec.driver);
       const r = await runBounded(spec.list, st.root, cmdTimeoutS());
       if (r.code !== 0 || r.timedOut) {
         findings.push({ kind: 'list-failed', what: `${st.manifest.name}:${ds}`, detail: `its list: hook failed (${r.timedOut ? 'timed out' : `exit ${r.code}`}) — namespaces not checked` });
         continue;
       }
-      const names = r.output.split('\n').map((l) => l.trim()).filter((l) => /^backlot_[A-Za-z0-9_]+$/.test(l));
+      // Elasticsearch (decision 0050): the namespace is an index-name PREFIX,
+      // so `list:` may print index or alias names; each is reduced to the
+      // namespace before its first `-` or `.`, and a name under a referenced
+      // prefix (any separator) is referenced — a live index is never an orphan.
+      const es = spec.driver === 'elasticsearch';
+      const names = r.output.split('\n').map((l) => l.trim()).map((l) => (es ? (l.split(/[-.]/)[0] ?? '') : l)).filter((l) => /^backlot_[A-Za-z0-9_]+$/.test(l));
+      const isReferenced = (ns: string) => referencedNs.has(ns) || (es && [...referencedNs].some((ref) => ns.startsWith(ref)));
       for (const ns of new Set(names)) {
-        if (referencedNs.has(ns)) continue;
-        const owner = ownerOf(ns);
+        if (isReferenced(ns)) continue;
+        const owner = ownerOf(ns, fold);
         const finding: (typeof findings)[number] = owner !== undefined
           ? { kind: 'namespace', what: ns, detail: `datastore '${ds}' lists it and no environment, copy or template references it` }
           : { kind: 'foreign-namespace', what: ns, detail: `in runly's naming, but of a stack this state root has no record of (another state root's?) — never touched` };
@@ -3745,7 +3893,7 @@ export class Engine {
             for (const e of this.journal.allEnvs()) referenceEnv(e);
             for (const c of this.journal.allDbCopies()) referencedNs.add(c.ns);
             for (const m of markersOf(owner)) referencedNs.add(m);
-            if (referencedNs.has(ns) || inFlight().some((p) => ns.startsWith(p)) || [...this.dbBusy].some((name) => this.journal.getDbCopy(name)?.ns === ns)) {
+            if (isReferenced(ns) || inFlight().some((p) => startsWith(ns, p, fold)) || [...this.dbBusy].some((name) => this.journal.getDbCopy(name)?.ns === ns)) {
               finding.detail += ' — claimed by an operation in flight, left alone';
               return;
             }
@@ -4832,10 +4980,15 @@ export class Engine {
     try {
       const say: Progress = opts.say ?? (() => undefined);
       await this.ensureAppliances(stack, say, reservation);
-      const missing = this.envDatastores(stack).filter((n) => !env.datastoreNs[n]);
+      // A store the environment does not hold under its current name is
+      // created (restored) — and, as on a bind (decision 0050), every store
+      // derived from one created here is flushed: its content was computed
+      // from a source that did not exist.
+      const missing = this.envDatastores(stack).filter((n) => !this.holdsDatastore(stack, env, n));
       if (missing.length > 0) {
         const bakeKeys = templateBakeKeys(stack.manifest, stack.root, await triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)));
-        await this.prepareDatastores(stack, env, bakeKeys, missing.map((n) => ({ name: n, force: false })), say);
+        const plan = withDerived(stack.manifest, missing).filter((n) => this.envDatastores(stack).includes(n)).map((n) => ({ name: n, force: !missing.includes(n) }));
+        await this.prepareDatastores(stack, env, bakeKeys, plan, say);
       }
       const ctx = this.templateCtx(stack, env);
       await this.treeLocked(stack.id, () => this.runBuilds(stack, env, closure, ctx, say, { rebuild: false, mode: 'wake', decided }));

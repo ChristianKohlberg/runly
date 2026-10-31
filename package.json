@@ -1,6 +1,6 @@
 {
   "name": "@theford/runly",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "description": "Worktree-owned app environments for coding agents and humans: seeded data, activity-based idle and wake, stable proxy ports, and expiring public previews.",
   "keywords": [
     "environment",

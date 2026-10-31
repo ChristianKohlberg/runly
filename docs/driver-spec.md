@@ -57,9 +57,13 @@ environment and per copy. With such a rule the template is shared by every workt
 of the manifest name (`templates/<name>@shared/`, unless `share_templates: false`;
 decision 0044); `makeDatastore` takes that scope (`{ bakeKey, project, privateBake }`). `ephemeral: true` (Redis-class): no
 presets/templates; `drop:` is the flush on reset, `create:` runs only on first bind.
+`derived_from: <ds>` on an ephemeral datastore makes the engine (not the driver) flush
+it whenever a bind restores that source (decision 0050).
 
 **Namespace-drop safety:** the sqlite driver rejects keys containing `/`, `\`, or `..`,
-and the command family sanitizes the ns to `[A-Za-z0-9_]` — but a server driver's
+and the command family sanitizes the ns to `[A-Za-z0-9_]` (lowercase, with a hash of
+the original appended when lowering changed it, for the case-folding `mongodb` and
+`elasticsearch` — `serverNamespace`, decision 0050) — but a server driver's
 `drop:` command is repo-authored and runs verbatim, so its blast radius is the
 manifest author's responsibility (the [security model](overview.md#security-model)).
 

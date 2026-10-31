@@ -54,9 +54,23 @@ describe('stack.schema.json', () => {
       validate({
         name: 'x',
         services: { web: { run: 'node s.mjs' } },
-        datastores: { main: { driver: 'mongodb' } },
+        datastores: { main: { driver: 'cassandra' } },
       }),
     ).toBe(false);
+  });
+
+  it('accepts mongodb and a derived elasticsearch datastore (decision 0050)', () => {
+    const ok = validate({
+      name: 'x',
+      services: { web: { run: 'node s.mjs', env: { P: '{{datastores.db.preset}}', E: '{{env.slug}}' } } },
+      datastores: {
+        db: { driver: 'mongodb', url: 'mongodb://h/{{ns}}', presets: ['hlt', 'demo'], create: 'seed {{ns}} {{preset}}', template_restore: 'r {{template}} {{ns}}', drop: 'd {{ns}}', list: 'l' },
+        search: { driver: 'elasticsearch', ephemeral: true, derived_from: 'db', url: 'http://h', drop: 'd {{ns}}' },
+      },
+      upkeep: [{ when: '{{main_worktree}}/../data/**', run: '@rebake-template db' }],
+    });
+    expect(validate.errors ?? []).toEqual([]);
+    expect(ok).toBe(true);
   });
 
   it('rejects invalid symbolic port names', () => {
@@ -213,5 +227,17 @@ describe('exported resource names', () => {
       // protects callers that deliberately load without schema validation.
       expect(() => loadStack(dir, { validate: group !== 'ports' })).toThrow(/web.*WEB.*same exported environment variable/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('requires elasticsearch to be ephemeral, without presets or templates, and derived_from to be ephemeral', () => {
+    const m = (ds: Record<string, unknown>) => ({ name: 'x', services: { web: { run: 'true' } }, datastores: { db: { driver: 'mongodb', url: '{{ns}}' }, search: { url: 'http://h', ...ds } } });
+    expect(validate(m({ driver: 'elasticsearch', ephemeral: true, derived_from: 'db' }))).toBe(true);
+    expect(validate(m({ driver: 'elasticsearch' }))).toBe(false);
+    expect(validate(m({ driver: 'elasticsearch', ephemeral: false }))).toBe(false);
+    for (const extra of [{ presets: ['a'] }, { default_preset: 'a' }, { template_restore: 'cp' }]) {
+      expect(validate(m({ driver: 'elasticsearch', ephemeral: true, ...extra }))).toBe(false);
+    }
+    expect(validate(m({ driver: 'redis', derived_from: 'db' }))).toBe(false);
+    expect(validate(m({ driver: 'redis', ephemeral: true, derived_from: 'db' }))).toBe(true);
   });
 });

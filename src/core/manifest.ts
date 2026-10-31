@@ -91,7 +91,7 @@ export interface ServiceSpec {
 }
 
 export interface DatastoreSpec {
-  driver: 'sqlite' | 'postgres' | 'mssql' | 'mysql' | 'redis';
+  driver: 'sqlite' | 'postgres' | 'mssql' | 'mysql' | 'redis' | 'mongodb' | 'elasticsearch';
   server?: 'external';
   probe?: string;
   url?: string;
@@ -103,6 +103,15 @@ export interface DatastoreSpec {
   default_preset?: string | { run?: string; session?: string };
   template?: boolean;
   ephemeral?: boolean;
+  /**
+   * Derived state (decision 0050): an `ephemeral` datastore whose content is
+   * computed from another datastore of the stack (a search index fed from the
+   * database). Whenever that source is restored — created, reset, reloaded
+   * with a preset, re-restored for a new template — this one is flushed with
+   * its `drop:` command in the same bind, and the running services that use
+   * it restart with the source's users.
+   */
+  derived_from?: string;
   /**
    * Never provisioned for an environment (decision 0039): it exists only as
    * the source of `runly db new|with` copies. Its template is baked on the
@@ -349,12 +358,23 @@ export function loadStack(from: string, opts: { validate?: boolean } = {}): Stac
   const file = manifestIn(root);
   if (!file) throw new BrokerError('work-error', `no runly.yml or runly.yaml in ${root}`, 'manifest');
   const manifest = parse(readFileSync(file, 'utf8')) as Manifest;
-  if (opts.validate !== false) validate(manifest);
+  if (opts.validate !== false) {
+    // The schema refuses these too; the engine's own check says why in
+    // words, so it gets the first say — on a manifest it can read at all.
+    try {
+      checkDerivedDatastores(manifest, basename(file));
+    } catch (err) {
+      if (err instanceof BrokerError) throw err;
+    }
+    validate(manifest);
+  }
   // A path that escapes the worktree is refused at load, whether or not an
   // upkeep rule ever makes runly read it: it is never a legitimate source file.
   for (const inc of manifest.sync?.include ?? []) safeJoin(root, inc, 'sync.include');
   checkCopiesOnly(manifest, basename(file));
   checkDatastoreNamespaces(manifest);
+  checkDerivedDatastores(manifest, basename(file));
+  checkTemplateVariables(manifest, basename(file));
   checkExportNames(manifest);
   // Identity = absolute root + declared name; filesystem-safe. Hash the WHOLE
   // path: slicing base64url(root) kept only the last ~6 bytes, so sibling
@@ -398,6 +418,88 @@ function checkDatastoreNamespaces(manifest: Manifest): void {
     }
     names.set(normalized, name);
   }
+}
+
+/** Drivers whose server folds or forbids case in namespace names (decision 0050). */
+export const CASE_FOLDING_DRIVERS: ReadonlySet<DatastoreSpec['driver']> = new Set(['mongodb', 'elasticsearch']);
+
+/**
+ * Derived and search datastores (decision 0050). An `elasticsearch` datastore
+ * holds derived search state: it is `ephemeral` (no presets, no templates; a
+ * reset is its `drop:`). `derived_from` names the datastore it is computed
+ * from, which must be an ordinary datastore of this stack an environment has.
+ */
+function checkDerivedDatastores(manifest: Manifest, file: string): void {
+  const stores = manifest.datastores ?? {};
+  for (const [name, spec] of Object.entries(stores)) {
+    if (spec.driver === 'elasticsearch') {
+      if (spec.ephemeral !== true) {
+        throw new BrokerError('work-error', `datastore '${name}' (elasticsearch) must be 'ephemeral: true' in ${file}: an index holds derived search state, so it has no presets or templates and a reset is its drop: command`, 'manifest');
+      }
+      for (const key of ['presets', 'default_preset', 'template_restore'] as const) {
+        if (spec[key] !== undefined) throw new BrokerError('work-error', `datastore '${name}' (elasticsearch) declares '${key}' in ${file}, but search state is derived — it has no presets or templates; seed the datastore it is derived from instead`, 'manifest');
+      }
+    }
+    if (spec.derived_from === undefined) continue;
+    const src = stores[spec.derived_from];
+    const why =
+      spec.derived_from === name ? 'itself'
+      : src === undefined ? 'a datastore this manifest does not declare'
+      : src.copies_only === true ? 'a copies_only datastore (an environment has none)'
+      : src.derived_from !== undefined ? 'another derived datastore (one level only)'
+      : undefined;
+    if (why !== undefined) throw new BrokerError('work-error', `datastore '${name}' is derived_from '${spec.derived_from}' in ${file}, which is ${why}`, 'manifest');
+    if (spec.ephemeral !== true || spec.copies_only === true) {
+      throw new BrokerError('work-error', `datastore '${name}' declares derived_from in ${file} but is not 'ephemeral: true' (or is copies_only): only an ephemeral store is flushed when its source is restored`, 'manifest');
+    }
+  }
+}
+
+/** The `{{…}}` syntax `template()` (util.ts) resolves. */
+const TEMPLATE_VAR = /\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g;
+
+/**
+ * Every `{{…}}` in a templated field — a service's `run:`, `build:` command
+ * and `env:` values, and `auth.token` — must name a variable the environment
+ * has (docs/manifest.md): a declared port, a service with a port, a
+ * datastore an environment provisions, `env.id`/`env.slug`, and `{{role}}`
+ * in `auth.token`. A typo used to surface only when the service started —
+ * after its siblings were already booting.
+ */
+function checkTemplateVariables(manifest: Manifest, file: string): void {
+  const known = new Set<string>(['env.id', 'env.slug']);
+  for (const [svc, spec] of Object.entries(manifest.services ?? {})) {
+    if (!spec.port) continue;
+    known.add(`ports.${spec.port}`);
+    known.add(`public_ports.${spec.port}`);
+    known.add(`services.${svc}.url`);
+  }
+  for (const [ds, spec] of Object.entries(manifest.datastores ?? {})) {
+    if (spec.copies_only === true) continue;
+    for (const leaf of ['url', 'ns', 'preset']) known.add(`datastores.${ds}.${leaf}`);
+  }
+  const check = (where: string, text: unknown, extra: string[] = []) => {
+    if (typeof text !== 'string') return;
+    for (const m of text.matchAll(TEMPLATE_VAR)) {
+      const name = m[1]!;
+      if (known.has(name) || extra.includes(name)) continue;
+      const group = name.split('.')[0]!;
+      const sameGroup = [...known, ...extra].filter((k) => k.split('.')[0] === group);
+      const hint = sameGroup.length > 0 ? `; known here: ${sameGroup.map((k) => `{{${k}}}`).join(', ')}` : '; see the template variables in docs/manifest.md';
+      throw new BrokerError('work-error', `${where} in ${file} uses {{${name}}}, which is not a template variable${hint}`, 'manifest');
+    }
+  };
+  for (const [svc, spec] of Object.entries(manifest.services ?? {})) {
+    check(`service '${svc}' run:`, spec.run);
+    check(`service '${svc}' build:`, buildOf(spec)?.run);
+    for (const [k, v] of Object.entries(spec.env ?? {})) check(`service '${svc}' env ${k}`, v);
+  }
+  check('auth.token', manifest.auth?.token, ['role']);
+}
+
+/** The datastores derived from `source` (decision 0050). */
+export function derivedDatastores(manifest: Manifest, source: string): string[] {
+  return Object.entries(manifest.datastores ?? {}).filter(([, spec]) => spec.derived_from === source).map(([name]) => name);
 }
 
 /** Every string in `value`, with the manifest path it sits at (`services.web.ready.cmd`). */

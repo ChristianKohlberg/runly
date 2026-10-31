@@ -93,8 +93,9 @@ Usage:
                           'db drop'
   runly db with <datastore> [--preset NAME] [--runly-exit N] -- <cmd...>
                           run a command against a fresh copy (RUNLY_DB_URL; the
-                          database's own name in RUNLY_DB_DATABASE; runly's
-                          handle in RUNLY_DB_COPY), drop the copy when it
+                          database's own name in RUNLY_DB_DATABASE, its preset
+                          in RUNLY_DB_PRESET; runly's handle in RUNLY_DB_COPY),
+                          drop the copy when it
                           exits, and exit with its exit code. The command dies
                           with this CLI however it dies. runly's own failures
                           are marked 'runly db with:' on stderr (with --json a
@@ -222,7 +223,7 @@ db with take --preset NAME for their one datastore.
 Verbs that act on a lease or a copy take --holder <name> to act for another
 holder than the caller's worktree (any subdirectory of it counts).
 
-Every verb accepts --json. Long verbs (up/warm/reset-data) show live progress
+Every verb accepts --json, and --help/-h for its own usage. Long verbs (up/warm/reset-data) show live progress
 on a terminal (stderr); force with --progress, silence with --quiet. stdout stays clean.
 Exit codes: 0 ok · 1 work-error · 2 env-error · 3 infra-error · 64 usage.
 
@@ -247,12 +248,19 @@ const unitEnvNames: string[] = [];
 const flags = new Set<string>();
 const positional: string[] = [];
 let passthrough: string[] | null = null; // for `exec` / after `--`
+/** `runly <verb> … --help` / `-h`: print that verb's usage instead of running it. */
+let helpRequested = false;
 
 {
   const body = rawArgv.slice(1);
   for (let i = 0; i < body.length; i++) {
     // `-f` is the one short flag: `logs -f`, as tail(1) has it.
     const a = body[i] === '-f' && verb === 'logs' && passthrough === null ? '--follow' : body[i]!;
+    // Every verb answers --help / -h (before `--`, and before exec's command).
+    if (a === '--help' || a === '-h') {
+      helpRequested = true;
+      continue;
+    }
     // `exec` consumes the entire remainder verbatim (its own flags included),
     // except a leading `--json` which is ours; `--` also opens passthrough.
     if (verb === 'exec' && passthrough === null && a !== '--json' && !a.startsWith('--')) {
@@ -353,7 +361,38 @@ function hygiene(): string | undefined {
   return undefined;
 }
 
+/**
+ * The USAGE entries of one verb: each `  runly <verb> …` line with the lines
+ * indented under it. With a sub-verb (`db new`) only its entries, when it has
+ * any of its own. Empty for a verb USAGE does not list.
+ */
+function verbUsage(usage: string, verb: string, sub?: string): string {
+  const entries: string[][] = [];
+  let current: string[] | null = null;
+  for (const line of usage.split('\n')) {
+    if (/^ {2}runly /.test(line)) {
+      current = [line];
+      entries.push(current);
+    } else if (current && /^ {3,}\S/.test(line)) {
+      current.push(line);
+    } else {
+      current = null;
+    }
+  }
+  const head = (e: string[]) => e[0]!.trim().split(/\s+/);
+  const mine = entries.filter((e) => head(e)[1] === verb);
+  const narrowed = sub === undefined ? [] : mine.filter((e) => head(e)[2] === sub);
+  return (narrowed.length > 0 ? narrowed : mine).map((e) => e.join('\n')).join('\n');
+}
+
 async function main(): Promise<void> {
+  // `runly <verb> --help`, and `runly help <verb>`.
+  const helpFor = helpRequested && verb !== undefined && verb !== 'help' ? [verb, positional[0]] : verb === 'help' && positional[0] ? [positional[0], positional[1]] : undefined;
+  if (helpFor) {
+    const own = verbUsage(USAGE, helpFor[0]!, helpFor[1]);
+    console.log(own ? `Usage:\n${own}\n\nEvery verb accepts --json. 'runly --help' lists every verb and the shared flags.` : USAGE);
+    return;
+  }
   if (presetArgs.length > 0 && !['up', 'reset-data', 'db'].includes(verb ?? '')) {
     console.error('runly: --preset is supported by up, reset-data and db');
     process.exit(64);
@@ -1360,11 +1399,12 @@ async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
 /**
  * What `db with`'s command reads (and `db new` prints): RUNLY_DB_URL to
  * connect; RUNLY_DB_DATABASE, the database's own name on its server (the file
- * for sqlite); RUNLY_DB_COPY, runly's handle for `db drop`. RUNLY_DB_NAME is
+ * for sqlite); RUNLY_DB_PRESET, the preset it was restored with (decision
+ * 0050); RUNLY_DB_COPY, runly's handle for `db drop`. RUNLY_DB_NAME is
  * the handle too, kept for the scripts that read it.
  */
 function dbVars(copy: DbCopy): Record<string, string> {
-  return { RUNLY_DB_URL: copy.url, RUNLY_DB_DATABASE: copy.ns, RUNLY_DB_COPY: copy.name, RUNLY_DB_NAME: copy.name };
+  return { RUNLY_DB_URL: copy.url, RUNLY_DB_DATABASE: copy.ns, RUNLY_DB_PRESET: copy.preset, RUNLY_DB_COPY: copy.name, RUNLY_DB_NAME: copy.name };
 }
 
 /** A plain, aligned table; `-` for an empty cell. */
