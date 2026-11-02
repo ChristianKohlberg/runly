@@ -42,7 +42,7 @@ run under `sh` in the worktree; write POSIX sh.
 | `auth.token` | Command printing a token on stdout; `{{role}}`. |
 | `preview.publisher` | `cloudflare-quick` (default), `cloudflare-named` or `tailscale`. |
 | `preview.domain`, `preview.prefix` | `cloudflare-named`: the zone, and the hostname suffix (default: the environment id). |
-| `preview.https_port` | `tailscale`: the tailnet HTTPS port (default: derived per environment and service). |
+| `preview.https_port` | `tailscale`: the tailnet HTTPS port (default: derived per environment and service). A pinned port serves one service of a lease; publish another service with its own `--https-port`. |
 | `preview.forbidden` | `true`: `runly preview` is refused. |
 
 Templates are resolved in `services.<svc>.run`, `services.<svc>.build` (its

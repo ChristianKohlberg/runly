@@ -82,8 +82,10 @@ Each publisher turns the manifest's `preview` block into an address itself.
 | `checkPrerequisite()` | Is the external tool usable? Its absence is an **env-error**, and `doctor` reports it for every stack that has preview configured. |
 | `start({envId, service, localUrl, logDir})` | Spawn a supervised, backlot-tagged tunnel and return `{url, pid}`. The adapter **owns the process until it returns a pid**: if it throws, it must already have killed it — nothing downstream can reap a tunnel whose pid was never recorded, and a live one is a public, unauthenticated URL nobody can name. |
 | `stop(rec)` | True **only** when the tunnel is confirmed gone; a false verdict keeps the caller's record, because a forgotten preview pid is a URL no one can ever reclaim. |
+| `claim(settings)` (optional) | The address these settings pin, in words (`tailscale`: `tailnet port N`), or nothing. The engine refuses a publish whose claim another service's preview of the same lease holds (decision 0052) without learning what the claim means. |
 
-The engine owns the deadline and journals the tunnel on the lease. `localUrl`
+The engine owns the deadline and journals each service's tunnel on the lease
+(one preview per service, decision 0052). `localUrl`
 must target its private expiry gate, never the service directly. Expiry closes
 that gate and open streams independently of tunnel cleanup or environment locks.
 Service restarts do not end publication; expiry, explicit stop and release do.

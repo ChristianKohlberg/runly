@@ -15,7 +15,7 @@ No automatic TTL, dead-agent, capacity or crash-loop deletion, and no automatic
 pristine retry. TTL exists only for public previews; environment leases never expire. Confirmed missing worktree
 (ENOENT/ENOTDIR) or explicit destroy/recycle removes the environment. Other stat
 errors retain it. DB copies keep their separate process/command lifetime.
-Schema 5 blocks destructive older daemons. `tests/proxy-activity.test.ts`, lifecycle,
+Schema 5 blocks destructive older daemons; schema 6 moves previews to `lease_previews` (decision 0052). `tests/proxy-activity.test.ts`, lifecycle,
 lease-liveness and pool-machine-capacity tests cover this contract.
 
 ## Build & test
@@ -118,9 +118,14 @@ versions we have not seen.
 
 ## The preview tunnel is scoped to the lease, not to the services it publishes
 
-`runly preview` journals its tunnel on the **lease row** (`preview_*`), not in
+`runly preview` journals its tunnel on the **lease**, one row per service in
+`lease_previews` (schema 6, [decision 0052](docs/decisions/0052-previews-are-per-service.md)), not in
 `env.servicePids` — so none of the service-reap machinery above owns it, and the
 lifetime rule is deliberately different ([decision 0027](docs/decisions/0027-lease-scoped-public-preview.md)).
+Every preview path takes a SERVICE and touches only that service's row, timer
+(`previewKey(lease, service)`), gate and restore state; a lease-wide action
+(release, teardown, shutdown, `forbidden`, `preview stop` without a name) loops
+over `lease.previews`. Never let one service's publish or stop reach another's.
 A rebind, a restarting `up` or an idle quiesce restarts or stops services while the lease
 continues, and the tunnel **survives all of them**; ports are stable for an
 environment's lifetime, so it is aimed at the same place when the services return.
@@ -155,7 +160,7 @@ bind is legitimate — and the message rides back on the bind's own result as
 Both preview verbs re-read the lease *inside* `envLocked`, `clearLeasePreview` is
 a compare-and-swap on the pid, and `endLease` re-reads between the stop and the
 delete (it cannot take the env lock — `tryClaim` calls it under the pool lock),
-so no stale snapshot can forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
+so no stale snapshot can forget a tunnel someone else just published. `tests/preview-tunnel.test.ts` and `tests/preview-multi-service.test.ts`
 covers all of it.
 
 For the successful-bind configuration ledger and refresh/reuse eligibility, see
@@ -347,7 +352,7 @@ When updating this file, preserve this bar for all agents and keep entries conci
 - A datastore with an `@rebake-template` key and without `share_templates: false` keeps its templates in `templates/<name>@shared/`; every other in `templates/<stack id>/`. Always build the driver with `templateScope(stack, bakeKeys, ds)` in the engine — a bare bake key means "per stack" (what unit tests use).
 - Restores read the database name from the MARKER (`parseBakedMarker(...).ns`), never recompute it: an adopted pre-0.20 template keeps its old name, and a bake whose name another marker holds appends a nonce. A bake never drops a database another marker names; retention and doctor remove such a marker without its database.
 - Retention and `pool doctor` share one classifier, `templateVerdicts` (`src/core/retention.ts`); change it there, not in one of them. `worktrees/<stack>/templates.json` (written at each restore) is a reference.
-- `leases.preview_restore` is written only by `setLeasePreviewRestore`, never by `saveLease` (a stale lease snapshot would erase it). Ending a preview on purpose must call `forgetPreview`; reaping a tunnel (shutdown, recover) must not. `tests/shared-templates.test.ts` and the restart block of `tests/preview-tailscale.test.ts` are the regression tests.
+- `lease_previews.restore` (and the live tunnel fields) are written only by `setLeasePreviewRestore` / `setLeasePreview` / `clearLeasePreview`, never by `saveLease` (a stale lease snapshot would erase them). Ending a preview on purpose must call `forgetPreview`; reaping a tunnel (shutdown, recover) must not. `tests/shared-templates.test.ts` and the restart block of `tests/preview-tailscale.test.ts` are the regression tests.
 
 ## Public preview deadlines and proxy failures
 

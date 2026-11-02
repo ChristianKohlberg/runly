@@ -145,8 +145,8 @@ Runly isolates names and ports, not filesystem or operating-system access.
 The control socket is protected by local file permissions; service proxies
 listen on loopback.
 
-[Public previews](operations.md#previews) expire after 30 minutes by default.
+[Public previews](operations.md#previews) are per service and expire after 30 minutes by default.
 Successful `up` renews active access or reopens automatically expired access;
-`preview stop` clears that intent. Cloudflare URLs have no application login
+`preview stop [<service>]` clears that intent. Cloudflare URLs have no application login
 added by Runly. Keep sensitive stacks private with `preview.forbidden: true`.
 A stable hostname is not a promise of continuous access.
