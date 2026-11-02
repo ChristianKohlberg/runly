@@ -83,7 +83,7 @@ it('composes canonical ownership, selected preset, preview group and preserved d
     check(await f.cli(['reset-data'], f.alias));
     const db = new DatabaseSync(join(f.state, 'journal.db'), { readOnly: true });
     try {
-      expect(db.prepare('PRAGMA user_version').get()!.user_version).toBe(5);
+      expect(db.prepare('PRAGMA user_version').get()!.user_version).toBe(6);
       // Decision 0034: the preset is what the datastore holds (envs.presets),
       // not lease intent — a later up without --preset keeps it.
       const env = db.prepare('SELECT presets FROM envs WHERE id=?').get(first.data.envId)!;

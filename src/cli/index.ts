@@ -146,18 +146,25 @@ Usage:
                           tunnel (Cloudflare by default). The URL is unauthenticated
                           — anyone with the link reaches the service. Requires
                           cloudflared on PATH (or BACKLOT_CLOUDFLARED).
+                          Each service has its own preview: publishing one leaves
+                          the lease's other previews alone, and publishing the
+                          same service again renews it (same address where the
+                          publisher can keep one).
                           With preview.publisher: tailscale it is served on this
-                          machine's tailnet name instead (tailnet only);
-                          --https-port pins that port for this publish.
+                          machine's tailnet name instead (tailnet only), each
+                          service on its own port; --https-port pins that port
+                          for this publish (two services cannot pin the same one).
                           Public access expires after 30 minutes (override with --ttl).
-                          A successful up renews or reopens an expired preview for
-                          that TTL; preview stop disables reopening.
-                          A daemon restart preserves the deadline and restores
+                          A successful up renews or reopens each expired preview for
+                          its TTL; preview stop disables reopening.
+                          A daemon restart preserves the deadlines and restores
                           only unexpired access (same address where the publisher
-                          can keep one; ctx --json: previewRestore says how
+                          can keep one; ctx --json: previews.<service> says how
                           that went)
-  runly preview stop      stop the preview tunnel on your lease (also one a
-                          restart could not publish again)
+  runly preview stop [<service>]
+                          stop that service's preview on your lease, or every
+                          preview of it without a service (also one a restart
+                          could not publish again, or one that expired)
   runly stats [--all] [--since 30m]
                           bounded local measurements (up to 24h), no service wake.
                           --json includes histogram estimates and recent operations.
@@ -850,9 +857,11 @@ async function main(): Promise<void> {
     case 'preview': {
       const sub = positional[0];
       if (sub === 'stop') {
-        res = await rpc('preview-stop', { cwd, holder });
+        // With a service: that service's preview only; without: every
+        // preview of the lease (decision 0052).
+        res = await rpc('preview-stop', { cwd, holder, ...(positional[1] !== undefined ? { service: positional[1] } : {}) });
       } else if (!sub) {
-        console.error('runly preview: which service? (usage: runly preview <service> | runly preview stop)');
+        console.error('runly preview: which service? (usage: runly preview <service> | runly preview stop [<service>])');
         process.exit(64);
       } else {
         const ttl = flagValue('--ttl');
@@ -1137,9 +1146,20 @@ interface DbCopy {
   createdAt: number;
 }
 
+/** One service's preview as ctx.previews, ps and status report it (decision 0052). */
+interface PreviewView { url: string | null; state: string; error?: string; expiresAt: number | null }
+
+/** A preview in a few words: its URL and until when, or why it is not live. */
+function previewWords(p: PreviewView): string {
+  const at = p.expiresAt === null ? '' : new Date(p.expiresAt).toLocaleTimeString();
+  if (p.state === 'live') return `${p.url ?? ''}${at ? ` (until ${at})` : ''}`;
+  if (p.state === 'expired') return `${p.url ?? ''} (expired${at ? ` at ${at}` : ''}; the next successful up reopens it)`;
+  return `${p.url ?? ''} (${p.state}${p.error ? `: ${p.error}` : ''})`;
+}
+
 interface PsData {
   scope: string;
-  services: Array<{ env: string; worktree?: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; idleStopInMs?: number | null; rssBytes: number | null; failure?: { detail: string; hint: string } | null }>;
+  services: Array<{ env: string; worktree?: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; idleStopInMs?: number | null; rssBytes: number | null; failure?: { detail: string; hint: string } | null; preview?: PreviewView | null }>;
   databases: DbCopy[];
   failedUps?: Array<{ env: string; message: string; class: string | null; hint: string }>;
   budget?: { enabled: boolean; memoryBytes: number; cpu: number; committedMemoryBytes: number; committedCpu: number; waiting: number };
@@ -1429,7 +1449,7 @@ function dbLines(copies: DbCopy[]): string[] {
 interface StatusData {
   pid: number;
   supervisor: string;
-  envs: Array<{ id: string; state: string; worktree: string; summary: string; idleMs: number; lease: { holder: string; expiresAt: number | null; holderPid?: number } | null }>;
+  envs: Array<{ id: string; state: string; worktree: string; summary: string; idleMs: number; lease: { holder: string; expiresAt: number | null; holderPid?: number } | null; previews?: Record<string, PreviewView> }>;
   poolMaxTotal: number;
   ports: { conflicts: string[] };
   budget: { enabled: boolean; memoryBytes: number; cpu: number; committedMemoryBytes: number; committedCpu: number; waiting: number };
@@ -1442,6 +1462,8 @@ function statusLines(d: StatusData): string[] {
   if (d.envs.length) {
     out.push('');
     out.push(...table(['ENV', 'STATE', 'IDLE', 'WORKTREE', 'SUMMARY'], d.envs.map((e) => [e.id, e.state, ago(e.idleMs), e.worktree, e.summary])));
+    // Every public preview of every lease, by service (decision 0052).
+    for (const e of d.envs) for (const [service, p] of Object.entries(e.previews ?? {})) out.push(`${e.id} preview ${service}: ${previewWords(p)}`);
   }
   if (d.budget.enabled) {
     out.push('');
@@ -1488,6 +1510,8 @@ function psLines(d: PsData, all: boolean): string[] {
     ])));
     // A failed service says how it ended and where to look (decision 0039).
     for (const s of d.services) if (s.failure) out.push(`${s.service} ${s.failure.detail} — '${s.failure.hint}' shows why; the next 'runly up' retries it`);
+    // Every service's public preview (decision 0052).
+    for (const s of d.services) if (s.preview) out.push(`${all ? `${s.env} ` : ''}preview ${s.service}: ${previewWords(s.preview)}`);
     for (const f of d.failedUps ?? []) out.push(`${f.env}: the last 'runly up' failed${f.class ? ` [${f.class}]` : ''}: ${f.message} — ${f.hint}`);
     const running = d.services.filter((s) => s.state === 'running' || s.state === 'starting').length;
     if (running === 0 && (d.failedUps ?? []).length === 0) out.push(`nothing is running — ${d.services.length} service(s) idle, stopped or down; the next 'runly up' or connection starts what is wanted`);

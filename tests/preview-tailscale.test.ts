@@ -425,3 +425,95 @@ describe('a daemon restart re-publishes the preview', () => {
     expect((await cli(['ctx', '--json'])).json?.previewRestore).toBeNull();
   }, 60_000);
 });
+
+/**
+ * Previews are per service within a lease (decision 0052): each service is
+ * served on its own tailnet port by its own foreground `tailscale serve`, and
+ * two services of one lease can never be pinned to the same port.
+ */
+describe('multi-service previews on the tailnet', () => {
+  const API = '  api: { run: node srv.mjs, port: api, env: { PORT: "{{ports.api}}" }, ready: { log: ready, timeout: 20 } }\n';
+  const servingPid = (tsDir: string, url: string) => Number(readFileSync(join(tsDir, 'serving', new URL(url).port), 'utf8'));
+
+  it('serves each service on its own derived port; re-publishing one keeps its address and leaves the other alone', async () => {
+    const { cli, tsDir } = ctx(`${API}${TS}`);
+    expect((await cli(['up', '--json'])).code).toBe(0);
+    const web = await cli(['preview', 'web', '--json']);
+    expect(web.code, web.stderr).toBe(0);
+    const api = await cli(['preview', 'api', '--json']);
+    expect(api.code, api.stderr).toBe(0);
+    const webUrl = String(web.json?.url);
+    const apiUrl = String(api.json?.url);
+    expect(webUrl).toMatch(/^https:\/\/box\.tail1234\.ts\.net:32\d{3}$/);
+    expect(apiUrl).toMatch(/^https:\/\/box\.tail1234\.ts\.net:32\d{3}$/);
+    expect(apiUrl).not.toBe(webUrl);
+    expect((await cli(['ctx', '--json'])).json?.previewUrls).toEqual({ web: webUrl, api: apiUrl });
+    const webPid = servingPid(tsDir, webUrl);
+    const apiPid = servingPid(tsDir, apiUrl);
+    expect(webPid).not.toBe(apiPid);
+
+    const again = await cli(['preview', 'web', '--json']);
+    expect(again.code, again.stderr).toBe(0);
+    expect(again.json?.url).toBe(webUrl);
+    expect(await goneWithin(webPid, 5000)).toBe(true);
+    expect(alive(apiPid)).toBe(true);
+    expect(servingPid(tsDir, apiUrl)).toBe(apiPid);
+
+    expect((await cli(['preview', 'stop', 'api', '--json'])).code).toBe(0);
+    expect(await goneWithin(apiPid, 5000)).toBe(true);
+    expect((await cli(['ctx', '--json'])).json?.previewUrls).toEqual({ web: webUrl });
+  }, 60_000);
+
+  it('two services cannot pin the same port: the second is a work-error and the first keeps serving', async () => {
+    const { cli, tsDir } = ctx(`${API}${TS}  https_port: 20631\n`);
+    expect((await cli(['up', '--json'])).code).toBe(0);
+    const web = await cli(['preview', 'web', '--json']);
+    expect(web.code, web.stderr).toBe(0);
+    expect(web.json?.url).toBe('https://box.tail1234.ts.net:20631');
+    const webPid = servingPid(tsDir, String(web.json?.url));
+
+    // The manifest pins 20631 for every publish, and web holds it.
+    const clash = await cli(['preview', 'api', '--json']);
+    expect(clash.code, clash.stdout + clash.stderr).toBe(1);
+    expect(clash.stderr + clash.stdout).toMatch(/tailnet port 20631 is already pinned by this lease's preview of 'web'/);
+    expect(alive(webPid)).toBe(true);
+
+    // --https-port gives api its own port.
+    const api = await cli(['preview', 'api', '--https-port', '20632', '--json']);
+    expect(api.code, api.stderr).toBe(0);
+    expect(api.json?.url).toBe('https://box.tail1234.ts.net:20632');
+
+    // Re-pinning web onto api's port is refused the same way, and web keeps serving.
+    const steal = await cli(['preview', 'web', '--https-port', '20632', '--json']);
+    expect(steal.code).toBe(1);
+    expect(steal.stderr + steal.stdout).toMatch(/tailnet port 20632 is already pinned by this lease's preview of 'api'/);
+    expect(alive(webPid)).toBe(true);
+    expect((await cli(['ctx', '--json'])).json?.previewUrls).toEqual({
+      web: 'https://box.tail1234.ts.net:20631',
+      api: 'https://box.tail1234.ts.net:20632',
+    });
+  }, 60_000);
+
+  it('a daemon restart re-publishes every service at its own address', async () => {
+    const { cli, stateDir, tsDir } = ctx(`${API}${TS}`);
+    expect((await cli(['up', '--json'])).code).toBe(0);
+    const web = await cli(['preview', 'web', '--https-port', '20641', '--json']);
+    const api = await cli(['preview', 'api', '--json']);
+    expect(web.code + api.code).toBe(0);
+    const before = [servingPid(tsDir, String(web.json?.url)), servingPid(tsDir, String(api.json?.url))];
+    const daemon = Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8'));
+    process.kill(daemon, 'SIGKILL');
+    expect(await goneWithin(daemon, 5000)).toBe(true);
+    const deadline = Date.now() + 20_000;
+    let urls: Record<string, string> = {};
+    while (Date.now() < deadline) {
+      urls = ((await cli(['ctx', '--json'])).json?.previewUrls as Record<string, string>) ?? {};
+      if (Object.keys(urls).length === 2) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(urls).toEqual({ web: web.json?.url, api: api.json?.url });
+    for (const pid of before) expect(await goneWithin(pid, 5000)).toBe(true);
+    expect(alive(servingPid(tsDir, String(web.json?.url)))).toBe(true);
+    expect(alive(servingPid(tsDir, String(api.json?.url)))).toBe(true);
+  }, 60_000);
+});

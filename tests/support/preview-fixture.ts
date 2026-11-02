@@ -55,7 +55,7 @@ export function makeFakeCloudflared(dir: string): string {
   writeFileSync(
     script,
     `import { writeFileSync } from 'node:fs';
-const u = process.env.FAKE_PREVIEW_URL || '${FAKE_URL}';
+const u = (process.env.FAKE_PREVIEW_URL || '${FAKE_URL}').replace('{pid}', String(process.pid));
 writeFileSync(process.env.FAKE_PREVIEW_PIDFILE, String(process.pid));
 writeFileSync(process.env.FAKE_PREVIEW_PIDFILE + ".args", JSON.stringify(process.argv.slice(2)));
 setTimeout(() => {}, 3600_000);

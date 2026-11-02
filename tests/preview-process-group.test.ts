@@ -145,7 +145,7 @@ describe('leased preview process groups', () => {
     const db = new DatabaseSync(join(f.state, 'journal.db'));
     // Simulate the persisted state after leader PID reuse: the live group's
     // start time no longer matches the lease's recorded identity.
-    db.prepare('UPDATE leases SET preview_start = preview_start + 1 WHERE env_id = ?').run(envId);
+    db.prepare('UPDATE lease_previews SET start = start + 1 WHERE lease_id IN (SELECT id FROM leases WHERE env_id = ?)').run(envId);
     db.prepare("UPDATE envs SET state = 'warm' WHERE id = ?").run(envId);
     db.close();
     const gc = await f.cli('pool', 'gc');

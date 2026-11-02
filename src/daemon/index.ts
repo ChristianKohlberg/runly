@@ -103,7 +103,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
         args.httpsPort !== undefined ? Number(args.httpsPort) : undefined,
       );
     case 'preview-stop':
-      return engine.previewStop(cwd, holder);
+      return engine.previewStop(cwd, holder, args.service !== undefined ? String(args.service) : undefined);
     case 'appliance-ls':
       return engine.applianceLs(cwd);
     case 'appliance-start':

@@ -69,10 +69,10 @@ it.each(['expired', 'legacy'])('does not restore a %s publication after downtime
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(join(stateDir, 'journal.db'));
     try {
-      const row = db.prepare('SELECT id, preview_restore FROM leases').get()!;
-      const restore = JSON.parse(String(row.preview_restore));
+      const row = db.prepare("SELECT lease_id, restore FROM lease_previews WHERE service = 'web'").get()!;
+      const restore = JSON.parse(String(row.restore));
       delete restore.expiresAt;
-      db.prepare('UPDATE leases SET preview_restore = ? WHERE id = ?').run(JSON.stringify(restore), String(row.id));
+      db.prepare("UPDATE lease_previews SET restore = ? WHERE lease_id = ? AND service = 'web'").run(JSON.stringify(restore), String(row.lease_id));
     } finally { db.close(); }
   } else await sleep(Math.max(0, Number(before.json?.expiresAt) - Date.now()) + 100);
   const after = await cli(['ctx', '--json']);

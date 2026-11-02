@@ -33,7 +33,11 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
  */
 // Schema 5: worktree-owned environments must not be opened by a daemon that
 // destroys them on holder death, idle expiry or automatic capacity eviction.
-export const JOURNAL_SCHEMA_VERSION = 5;
+// Schema 6 (decision 0052): previews live in `lease_previews`, one row per
+// <lease, service>. A schema-5 daemon reads only the lease's `preview_*`
+// columns, so it would see no tunnel at all — never reap one, never restore
+// one — and an unnamed preview pid is a public URL that serves forever.
+export const JOURNAL_SCHEMA_VERSION = 6;
 /** SQLite-safe sentinel for an explicitly non-expiring lease. Exposed as null in ctx. */
 /** The oldest stamp this build still opens (decision 0042); older journals are refused untouched. */
 export const OLDEST_READABLE_JOURNAL_SCHEMA = 4;
@@ -135,20 +139,33 @@ export interface LeaseRow {
   /** Optional diagnostic process identity. Never controls environment lifetime. */
   holderPid?: number;
   holderStart?: number;
-  /** Active lease-scoped public preview tunnel, when `runly preview` is running. */
-  previewService?: string;
-  previewUrl?: string;
-  previewPid?: number;
-  previewStart?: number;
+  /**
+   * The lease's public previews, one per service (decision 0052), keyed by
+   * service. Read from the `lease_previews` table; never written by
+   * `saveLease` — only the dedicated preview writers below touch it, so a
+   * stale lease snapshot cannot erase a tunnel someone else just published.
+   */
+  previews: Record<string, LeasePreview>;
+}
+
+/**
+ * One service's preview on a lease (decision 0052): the live tunnel, when one
+ * runs, and what a restart or a successful `up` publishes again.
+ */
+export interface LeasePreview {
+  service: string;
+  /** Active lease-scoped public preview tunnel, when one runs. */
+  url?: string;
+  pid?: number;
+  start?: number;
   /** Local port the tunnel was published against, so a rebind can spot drift. */
-  previewPort?: number;
+  port?: number;
   /**
    * What `runly preview` published, kept until the preview is stopped on
    * purpose (0.20, decision 0045): a daemon restart reaps the tunnel and
-   * publishes it again from this. Written only by `setLeasePreviewRestore`,
-   * never by `saveLease`, so a stale lease snapshot cannot erase it.
+   * publishes it again from this. Written only by `setLeasePreviewRestore`.
    */
-  previewRestore?: PreviewRestore;
+  restore?: PreviewRestore;
 }
 
 /** A published preview, as a restart re-publishes it (decision 0045). */
@@ -252,6 +269,7 @@ export class Journal {
     // journal is refused untouched rather than half-read (decision 0042).
     // Schema 4 itself is still read: 4 -> 5 changes no table, only which daemons
     // may open the file (decision 0046), so it is upgraded by the stamp below.
+    // 5 -> 6 moves the lease's single preview into `lease_previews` (below).
     const hasTables = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'envs'").get() !== undefined;
     if (hasTables && stamped < OLDEST_READABLE_JOURNAL_SCHEMA) {
       throw new BrokerError(
@@ -277,9 +295,12 @@ export class Journal {
       CREATE TABLE IF NOT EXISTS leases (
         id TEXT PRIMARY KEY, env_id TEXT NOT NULL, kind TEXT NOT NULL,
         holder TEXT NOT NULL, hygiene TEXT NOT NULL, expires_at INTEGER NOT NULL,
-        holder_pid INTEGER, holder_start INTEGER,
-        preview_service TEXT, preview_url TEXT, preview_pid INTEGER, preview_start INTEGER, preview_port INTEGER,
-        preview_restore TEXT
+        holder_pid INTEGER, holder_start INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS lease_previews (
+        lease_id TEXT NOT NULL, service TEXT NOT NULL,
+        url TEXT, pid INTEGER, start INTEGER, port INTEGER, restore TEXT,
+        PRIMARY KEY (lease_id, service)
       );
       CREATE TABLE IF NOT EXISTS counters (
         stack TEXT PRIMARY KEY, next_env INTEGER NOT NULL DEFAULT 1
@@ -295,14 +316,57 @@ export class Journal {
     `);
     // A schema-4 journal written by 0.16 or 0.17 lacks the columns added since
     // (additive: no schema bump). Only the duplicate-column case is benign.
-    for (const [table, col] of [['envs', 'activity TEXT'], ['envs', 'drop_recipes TEXT'], ['envs', 'templates TEXT'], ['db_copies', 'template TEXT'], ['db_copies', 'child TEXT'], ['leases', 'preview_restore TEXT']] as const) {
+    for (const [table, col] of [['envs', 'activity TEXT'], ['envs', 'drop_recipes TEXT'], ['envs', 'templates TEXT'], ['db_copies', 'template TEXT'], ['db_copies', 'child TEXT']] as const) {
       try {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
       } catch (err) {
         if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
       }
     }
-    if (stamped < JOURNAL_SCHEMA_VERSION) this.db.exec(`PRAGMA user_version = ${JOURNAL_SCHEMA_VERSION}`);
+    if (stamped < JOURNAL_SCHEMA_VERSION) {
+      // One transaction with the stamp: a kill mid-migration must leave a
+      // journal that migrates again, never one stamped 6 whose preview still
+      // sits in the old columns, where nothing reads it any more.
+      this.withTx(() => {
+        this.migrateLeasePreviews();
+        this.db.exec(`PRAGMA user_version = ${JOURNAL_SCHEMA_VERSION}`);
+      });
+    }
+  }
+
+  /**
+   * Schema 5 -> 6 (decision 0052): a lease's one preview moves from its
+   * `preview_*` columns to a `lease_previews` row keyed by its service — the
+   * live tunnel (pid, start, url, port) and the restore record alike, so the
+   * next daemon can still reap the tunnel and publish it again. The old
+   * columns are cleared, not dropped.
+   */
+  private migrateLeasePreviews(): void {
+    const cols = new Set((this.db.prepare('PRAGMA table_info(leases)').all() as Array<{ name: string }>).map((c) => c.name));
+    if (!cols.has('preview_pid')) return;
+    const restoreCol = cols.has('preview_restore');
+    const rows = this.db.prepare(
+      `SELECT id, preview_service, preview_url, preview_pid, preview_start, preview_port${restoreCol ? ', preview_restore' : ''} FROM leases`,
+    ).all() as Array<Record<string, unknown>>;
+    const insert = this.db.prepare(
+      `INSERT INTO lease_previews (lease_id, service, url, pid, start, port, restore) VALUES (?,?,?,?,?,?,?)
+       ON CONFLICT(lease_id, service) DO NOTHING`,
+    );
+    for (const r of rows) {
+      const restore = parseJson<PreviewRestore>(r.preview_restore);
+      const pid = (r.preview_pid as number | null) ?? null;
+      if (pid === null && !restore) continue;
+      // A live tunnel migrates even when nothing names its service: the pid
+      // is what lets the next daemon reap it.
+      const service = (r.preview_service as string | null) ?? restore?.service ?? '?';
+      insert.run(
+        r.id as string, service, (r.preview_url as string | null) ?? null, pid, (r.preview_start as number | null) ?? null,
+        (r.preview_port as number | null) ?? null, restore ? JSON.stringify({ ...restore, service }) : null,
+      );
+    }
+    this.db.exec(
+      `UPDATE leases SET preview_service=NULL, preview_url=NULL, preview_pid=NULL, preview_start=NULL, preview_port=NULL${restoreCol ? ', preview_restore=NULL' : ''}`,
+    );
   }
 
   /**
@@ -466,6 +530,7 @@ export class Journal {
     // that no longer existed (the sweeper prunes that half-state as backstop).
     this.withTx(() => {
       this.db.prepare('DELETE FROM envs WHERE id = ?').run(id);
+      this.db.prepare('DELETE FROM lease_previews WHERE lease_id IN (SELECT id FROM leases WHERE env_id = ?)').run(id);
       this.db.prepare('DELETE FROM leases WHERE env_id = ?').run(id);
     });
   }
@@ -497,17 +562,13 @@ export class Journal {
     this.db.prepare('UPDATE envs SET service_pids = ? WHERE id = ?').run(JSON.stringify(pids), id);
   }
 
-  saveLease(l: LeaseRow): void {
+  saveLease(l: Omit<LeaseRow, 'previews'>): void {
     this.db
       .prepare(
-        `INSERT INTO leases (id, env_id, kind, holder, hygiene, expires_at, holder_pid, holder_start,
-           preview_service, preview_url, preview_pid, preview_start, preview_port)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO leases (id, env_id, kind, holder, hygiene, expires_at, holder_pid, holder_start)
+         VALUES (?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET expires_at=excluded.expires_at, hygiene=excluded.hygiene,
-           holder_pid=excluded.holder_pid, holder_start=excluded.holder_start,
-           preview_service=excluded.preview_service, preview_url=excluded.preview_url,
-           preview_pid=excluded.preview_pid, preview_start=excluded.preview_start,
-           preview_port=excluded.preview_port`,
+           holder_pid=excluded.holder_pid, holder_start=excluded.holder_start`,
       )
       .run(
         l.id,
@@ -518,39 +579,80 @@ export class Journal {
         l.expiresAt,
         l.holderPid ?? null,
         l.holderStart ?? null,
-        l.previewService ?? null,
-        l.previewUrl ?? null,
-        l.previewPid ?? null,
-        l.previewStart ?? null,
-        l.previewPort ?? null,
       );
   }
 
   /**
-   * Forget a lease's preview tunnel — compare-and-swap on the pid.
+   * Record the live tunnel of one service's preview (decision 0052). A lease
+   * that is gone by now records nothing: its row is what names the tunnel,
+   * and the caller re-reads the lease before it writes.
+   */
+  setLeasePreview(id: string, service: string, live: { url: string; pid: number; start?: number; port: number }): void {
+    this.db.prepare(
+      `INSERT INTO lease_previews (lease_id, service, url, pid, start, port)
+         SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM leases WHERE id = ?)
+       ON CONFLICT(lease_id, service) DO UPDATE SET url=excluded.url, pid=excluded.pid, start=excluded.start, port=excluded.port`,
+    ).run(id, service, live.url, live.pid, live.start ?? null, live.port, id);
+  }
+
+  /**
+   * Forget one service's preview tunnel — compare-and-swap on the pid.
    *
    * Every caller reached here holding a lease SNAPSHOT, so an unconditional
    * clear let a slow one wipe the record of a tunnel someone else had already
    * published in its place. That pid is then unnameable, and an unnameable
    * preview pid is a public, unauthenticated URL that serves forever. Passing
    * the pid that was actually stopped makes a stale caller a no-op; the
-   * pid-less form is only for a row that is being deleted outright.
+   * pid-less form is only for a row that is being deleted outright. Other
+   * services' previews on the same lease are never touched.
    */
-  clearLeasePreview(id: string, stoppedPid?: number): void {
-    const cols = 'preview_service=NULL, preview_url=NULL, preview_pid=NULL, preview_start=NULL, preview_port=NULL';
-    if (stoppedPid === undefined) {
-      this.db.prepare(`UPDATE leases SET ${cols} WHERE id=?`).run(id);
+  clearLeasePreview(id: string, service: string, stoppedPid?: number): void {
+    const cols = 'url=NULL, pid=NULL, start=NULL, port=NULL';
+    if (stoppedPid === undefined) this.db.prepare(`UPDATE lease_previews SET ${cols} WHERE lease_id=? AND service=?`).run(id, service);
+    else this.db.prepare(`UPDATE lease_previews SET ${cols} WHERE lease_id=? AND service=? AND pid=?`).run(id, service, stoppedPid);
+    this.dropEmptyPreview(id, service);
+  }
+
+  /** Record (or, with null, forget) what a restart re-publishes for this service's preview (decisions 0045, 0052). */
+  setLeasePreviewRestore(id: string, service: string, restore: PreviewRestore | null): void {
+    if (restore) {
+      this.db.prepare(
+        `INSERT INTO lease_previews (lease_id, service, restore)
+           SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM leases WHERE id = ?)
+         ON CONFLICT(lease_id, service) DO UPDATE SET restore=excluded.restore`,
+      ).run(id, service, JSON.stringify(restore), id);
       return;
     }
-    this.db.prepare(`UPDATE leases SET ${cols} WHERE id=? AND preview_pid=?`).run(id, stoppedPid);
+    this.db.prepare('UPDATE lease_previews SET restore=NULL WHERE lease_id=? AND service=?').run(id, service);
+    this.dropEmptyPreview(id, service);
   }
 
-  /** Record (or, with null, forget) what a restart re-publishes for this lease (decision 0045). */
-  setLeasePreviewRestore(id: string, restore: PreviewRestore | null): void {
-    this.db.prepare('UPDATE leases SET preview_restore = ? WHERE id = ?').run(restore ? JSON.stringify(restore) : null, id);
+  /** A row with neither a tunnel nor a publication to restore says nothing. */
+  private dropEmptyPreview(id: string, service: string): void {
+    this.db.prepare('DELETE FROM lease_previews WHERE lease_id=? AND service=? AND pid IS NULL AND restore IS NULL').run(id, service);
   }
 
-  private rowToLease(r: Record<string, unknown>): LeaseRow {
+  private rowToPreview(r: Record<string, unknown>): LeasePreview {
+    return {
+      service: r.service as string,
+      url: (r.url as string | null) ?? undefined,
+      pid: (r.pid as number | null) ?? undefined,
+      start: (r.start as number | null) ?? undefined,
+      port: (r.port as number | null) ?? undefined,
+      restore: parseJson<PreviewRestore>(r.restore),
+    };
+  }
+
+  private previewsOf(leaseId: string): Record<string, LeasePreview> {
+    const out: Record<string, LeasePreview> = {};
+    for (const r of this.db.prepare('SELECT * FROM lease_previews WHERE lease_id = ? ORDER BY service').all(leaseId) as Record<string, unknown>[]) {
+      const p = this.rowToPreview(r);
+      out[p.service] = p;
+    }
+    return out;
+  }
+
+  private rowToLease(r: Record<string, unknown>, previews?: Record<string, LeasePreview>): LeaseRow {
     return {
       id: r.id as string,
       envId: r.env_id as string,
@@ -560,12 +662,7 @@ export class Journal {
       expiresAt: r.expires_at as number,
       holderPid: (r.holder_pid as number | null) ?? undefined,
       holderStart: (r.holder_start as number | null) ?? undefined,
-      previewService: (r.preview_service as string | null) ?? undefined,
-      previewUrl: (r.preview_url as string | null) ?? undefined,
-      previewPid: (r.preview_pid as number | null) ?? undefined,
-      previewStart: (r.preview_start as number | null) ?? undefined,
-      previewPort: (r.preview_port as number | null) ?? undefined,
-      previewRestore: parseJson<PreviewRestore>(r.preview_restore),
+      previews: previews ?? this.previewsOf(r.id as string),
     };
   }
 
@@ -589,13 +686,23 @@ export class Journal {
   }
 
   allLeases(): LeaseRow[] {
+    const previews = new Map<string, Record<string, LeasePreview>>();
+    for (const r of this.db.prepare('SELECT * FROM lease_previews ORDER BY lease_id, service').all() as Record<string, unknown>[]) {
+      const p = this.rowToPreview(r);
+      const of = previews.get(r.lease_id as string) ?? {};
+      of[p.service] = p;
+      previews.set(r.lease_id as string, of);
+    }
     return (this.db.prepare('SELECT * FROM leases').all() as Record<string, unknown>[]).map((r) =>
-      this.rowToLease(r),
+      this.rowToLease(r, previews.get(r.id as string) ?? {}),
     );
   }
 
   deleteLease(id: string): void {
-    this.db.prepare('DELETE FROM leases WHERE id = ?').run(id);
+    this.withTx(() => {
+      this.db.prepare('DELETE FROM leases WHERE id = ?').run(id);
+      this.db.prepare('DELETE FROM lease_previews WHERE lease_id = ?').run(id);
+    });
   }
 
   /** Shift every deadline by `ms` — the sleep pardon (decision 0009). */
