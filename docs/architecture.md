@@ -198,11 +198,12 @@ proof of deletion. Renaming a worktree removes its old path and therefore also
 triggers cleanup. Explicit `destroy` and `pool recycle` remain destructive.
 Environment leases never expire; `--ttl` is rejected outside `preview`. Public
 previews always expire (30 minutes by default, `preview --ttl <minutes>` to change
-it). Expiry closes public access, including open streams, but retains the lease
-and environment. A successful `up` renews an active preview for its configured TTL. Failed `up`
-calls and daemon restarts do not extend it. A successful `up` also reopens a
+it). A lease has one preview per service (decision 0052), each with its own
+tunnel, deadline and TTL. Expiry closes public access, including open streams, but retains the lease
+and environment. A successful `up` renews each active preview for its configured TTL. Failed `up`
+calls and daemon restarts do not extend it. A successful `up` also reopens each
 previously enabled preview after automatic expiry, using its saved TTL. Explicit
-`preview stop`, `release`, or a forbidden-preview configuration clears that intent. `--holder-pid` on `up` is diagnostic metadata only; there is no
+`preview stop [<service>]`, `release`, or a forbidden-preview configuration clears that intent. `--holder-pid` on `up` is diagnostic metadata only; there is no
 agent-specific automatic tether. Required caller inputs lost on release or daemon
 restart must be supplied by a fresh `up` before services using them can wake.
 
@@ -248,7 +249,7 @@ environment and answers to no pool cap. Every environment counts against `poolMa
 ### Journal upgrade barrier
 
 The journal stamps its schema in `PRAGMA user_version`, and a daemon refuses a
-journal stamped newer than it understands. The current schema is 5 (decision 0046): older daemons must not apply destructive lifetime policies to retained environments.
+journal stamped newer than it understands. The current schema is 6 (decision 0052): previews live in `lease_previews`, one row per lease and service, which a schema-5 daemon would not see (it could neither reap nor restore a tunnel); opening a schema-5 journal moves each lease's preview there in one transaction with the stamp. Schema 5 (decision 0046) keeps older daemons from applying destructive lifetime policies to retained environments.
 
 Journal schema 3 retains every observed unresolved process group in
 `servicePids.*.pgid` and additional `pgids`, including groups a process leaves.

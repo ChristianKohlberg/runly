@@ -1,5 +1,7 @@
 # 0047 — Public previews always expire; environments have no TTL
 
+- Status: Accepted; deadlines, renewal and reopening apply to each service's preview on its own since [0052](0052-previews-are-per-service.md).
+
 `--ttl` is accepted only by `preview` (minutes, positive and finite), default 30
 minutes. Each publication stores its absolute expiry independently of its lease.
 Successful `up` renews an active preview for its stored TTL from completion time,

@@ -60,6 +60,14 @@ export interface PreviewPublisher {
    * public, unauthenticated URL nobody can ever name again.
    */
   stop(rec: ServicePid): Promise<boolean>;
+  /**
+   * The address these settings PIN, in words (decision 0052), or undefined
+   * when they pin nothing two publications could both want. A lease publishes
+   * each service on its own, and two of its services must never be pinned to
+   * the same address: the second would take over the first's. The engine
+   * compares claims without knowing what they mean — the dialect stays here.
+   */
+  claim?(settings: PreviewSettings | undefined): string | undefined;
 }
 
 const URL_RE = /https:\/\/[^\s]+trycloudflare\.com/;
@@ -721,6 +729,11 @@ class TailscalePublisher implements PreviewPublisher {
   /** The foreground session dies with the process, and the tailnet mapping with it. */
   async stop(rec: ServicePid): Promise<boolean> {
     return killGroupVerified(rec.pid, rec.startTime);
+  }
+
+  /** Each service of a lease is served on its own tailnet port (decision 0052). */
+  claim(settings: PreviewSettings | undefined): string | undefined {
+    return settings?.https_port !== undefined ? `tailnet port ${settings.https_port}` : undefined;
   }
 }
 

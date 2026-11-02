@@ -119,11 +119,11 @@ proof of deletion. Renaming a worktree removes its old path and therefore also
 triggers cleanup. Explicit `destroy` and `pool recycle` remain destructive.
 Environment leases never expire; `--ttl` is rejected outside `preview`. Public
 previews always expire (30 minutes by default, `preview --ttl <minutes>` to change
-it). Expiry closes public access, including open streams, but retains the lease
-and environment. A successful `up` renews an active preview for its configured TTL. Failed `up`
-calls and daemon restarts do not extend it. A successful `up` also reopens a
+it). Each service has its own preview and deadline. Expiry closes public access, including open streams, but retains the lease
+and environment. A successful `up` renews each active preview for its configured TTL. Failed `up`
+calls and daemon restarts do not extend it. A successful `up` also reopens each
 previously enabled preview after automatic expiry, using its saved TTL. Explicit
-`preview stop`, `release`, or a forbidden-preview configuration clears that intent. `--holder-pid` on `up` is diagnostic metadata only; there is no
+`preview stop [<svc>]`, `release`, or a forbidden-preview configuration clears that intent. `--holder-pid` on `up` is diagnostic metadata only; there is no
 agent-specific automatic tether. Required caller inputs lost on release or daemon
 restart must be supplied by a fresh `up` before services using them can wake.
 
@@ -147,9 +147,11 @@ tether. This does not control the application environment.
   a verb fails with infra-error naming two versions, run `runly update`.
 - Preview without being asked: `runly preview <svc>` publishes an
   unauthenticated URL (Tailscale is tailnet-only). Public access has its own
-  deadline; a restart restores it only if unexpired. End publication and disable
-  reopening with `runly preview stop`. Check `previewExpiresAt` and
-  `previewRestore` in `ctx --json`, and any `previewNotice` from `up`.
+  deadline; a restart restores it only if unexpired. Previews are per service:
+  publishing one leaves the others alone. End publication and disable
+  reopening with `runly preview stop <svc>` (one) or `runly preview stop` (all).
+  Check `previews.<svc>` (`url`, `state`, `expiresAt`) in `ctx --json`, and
+  any `previewNotice` from `up`.
 
 ## Measure before tuning
 

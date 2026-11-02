@@ -4,7 +4,7 @@
  */
 import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
-import { Journal, JOURNAL_SCHEMA_VERSION, NO_LEASE_EXPIRY, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow, type PreviewRestore } from '../core/journal.js';
+import { Journal, JOURNAL_SCHEMA_VERSION, NO_LEASE_EXPIRY, type DbCopyRow, type DropRecipe, type EnvRow, type LeasePreview, type LeaseRow, type PreviewRestore } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
 import { CASE_FOLDING_DRIVERS, buildOf, canonicalDirectory, defaultPreset, derivedDatastores, findStackRoot, envDatastoreNames, type DatastoreSpec, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
@@ -26,7 +26,7 @@ import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, val
 import { cmdTimeoutS, runBounded, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
 import { hasOtherTemplateOwner, makeDatastore, parseBakedMarker, sharesTemplates, withBakeLock, type DsHandle, type TemplateScope } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
-import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher, type PreviewSettings } from '../drivers/preview.js';
+import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher, type PreviewPublisher, type PreviewSettings } from '../drivers/preview.js';
 import { EnvSupervisor, killGroupVerified, killPidVerified, reapPids, mergeServicePids, serviceGroups, type ServiceExit } from './supervisor.js';
 import { EXEC_SERVICE, groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanDbCopy, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
@@ -65,6 +65,10 @@ export type Progress = (phase: string) => void;
  */
 type BuildDecisions = Map<string, { cmd: string; run: boolean; key: string; reason?: string; at: number }>;
 const DECISION_TTL_MS = 30_000;
+/** In-memory key of one service's preview on one lease (decision 0052). */
+const previewKey = (leaseId: string, service: string): string => `${leaseId}\0${service}`;
+/** The previews of a lease whose tunnel process is recorded. */
+const livePreviews = (lease: LeaseRow): LeasePreview[] => Object.values(lease.previews).filter((p) => p.pid !== undefined);
 
 /** What one claim attempt found: an environment to bind, or nothing (capacity, or not this caller's turn). */
 type ClaimOutcome = { env: EnvRow; fresh: boolean } | null;
@@ -242,68 +246,83 @@ export class Engine {
   // Memory-only successful-bind configuration: a hot-reload refresh keeps the
   // services, so it cannot apply startup env/commands or other manifest configuration.
   private appliedManifests = new Map<string, string>();
-  /**
-   * Re-publishing the leases' previews after a restart (decision 0045), per
-   * lease id: in flight, or failed with the reason `ctx` reports. In memory:
-   * it describes this daemon life; the lease row keeps what to re-publish.
-   */
+  // Each preview's expiry timer and gate, and below its restore state, are
+  // keyed by previewKey(lease id, service) — one preview per service of a
+  // lease (decision 0052).
   private previewTimers = new Map<string, NodeJS.Timeout>();
   private previewGates = new Map<string, PreviewGate>();
 
-  private armPreview(leaseId: string, expiresAt: number): void {
-    clearTimeout(this.previewTimers.get(leaseId));
+  private armPreview(leaseId: string, service: string, expiresAt: number): void {
+    const key = previewKey(leaseId, service);
+    clearTimeout(this.previewTimers.get(key));
     const timer = setTimeout(() => {
-      this.previewTimers.delete(leaseId);
-      if (now() < expiresAt) { this.armPreview(leaseId, expiresAt); return; }
-      void this.expirePreview(leaseId).catch(err => logEvent({ level: 'error', kind: 'preview', detail: `preview expiry failed: ${String(err)}` }));
+      this.previewTimers.delete(key);
+      if (now() < expiresAt) { this.armPreview(leaseId, service, expiresAt); return; }
+      void this.expirePreview(leaseId, service).catch(err => logEvent({ level: 'error', kind: 'preview', detail: `preview expiry failed: ${String(err)}` }));
     }, Math.min(Math.max(0, expiresAt - now()), 2_147_483_647));
     timer.unref();
-    this.previewTimers.set(leaseId, timer);
+    this.previewTimers.set(key, timer);
   }
 
-  /** Called synchronously after a successful up, while the env lock is held. */
-  private renewPreview(envId: string): void {
+  /** Called synchronously after a successful up, while the env lock is held: every live preview of the lease is renewed. */
+  private renewPreviews(envId: string): void {
     const lease = this.journal.leaseForEnv(envId);
-    const preview = lease?.previewRestore;
-    if (!lease || !preview || !lease.previewPid || !sameProcess(lease.previewPid, lease.previewStart)) return;
-    const gate = this.previewGates.get(lease.id);
-    if (!gate || gate.pid !== lease.previewPid || (preview.expiresAt ?? 0) <= now()) return;
-    const ttlMs = preview.ttlMs ?? 30 * 60_000;
-    if (!Number.isFinite(ttlMs) || ttlMs <= 0) return;
-    const expiresAt = now() + ttlMs;
-    if (!gate.renew(expiresAt)) return;
-    this.journal.setLeasePreviewRestore(lease.id, { ...preview, ttlMs, expiresAt });
-    this.armPreview(lease.id, expiresAt);
-    logEvent({ level: 'info', kind: 'preview', envId, detail: `successful up renewed public preview until ${new Date(expiresAt).toISOString()}` });
+    if (!lease) return;
+    for (const p of Object.values(lease.previews)) {
+      const preview = p.restore;
+      if (!preview || !p.pid || !sameProcess(p.pid, p.start)) continue;
+      const gate = this.previewGates.get(previewKey(lease.id, p.service));
+      if (!gate || gate.pid !== p.pid || (preview.expiresAt ?? 0) <= now()) continue;
+      const ttlMs = preview.ttlMs ?? 30 * 60_000;
+      if (!Number.isFinite(ttlMs) || ttlMs <= 0) continue;
+      const expiresAt = now() + ttlMs;
+      if (!gate.renew(expiresAt)) continue;
+      this.journal.setLeasePreviewRestore(lease.id, p.service, { ...preview, ttlMs, expiresAt });
+      this.armPreview(lease.id, p.service, expiresAt);
+      logEvent({ level: 'info', kind: 'preview', envId, detail: `successful up renewed the public preview of '${p.service}' until ${new Date(expiresAt).toISOString()}` });
+    }
   }
 
-  private async expirePreview(leaseId: string): Promise<void> {
+  private async expirePreview(leaseId: string, service: string): Promise<void> {
     const lease = this.journal.allLeases().find(l => l.id === leaseId);
-    const deadline = lease?.previewRestore?.expiresAt;
-    if (!lease || (Number.isFinite(deadline) && (deadline ?? 0) > now())) return;
-    clearTimeout(this.previewTimers.get(leaseId));
-    this.previewTimers.delete(leaseId);
-    this.previewRestores.delete(leaseId);
+    const preview = lease?.previews[service];
+    const deadline = preview?.restore?.expiresAt;
+    if (!lease || !preview || (Number.isFinite(deadline) && (deadline ?? 0) > now())) return;
+    const key = previewKey(leaseId, service);
+    clearTimeout(this.previewTimers.get(key));
+    this.previewTimers.delete(key);
+    this.previewRestores.delete(key);
     // Expiry closes access but preserves explicit publication intent. Legacy
     // records without a deadline were never safely bounded: forget those.
-    if (!Number.isFinite(deadline)) this.forgetPreview(leaseId);
-    if (!lease.previewPid) return;
-    await this.stopPreviewForLease(lease);
-    logEvent({ level: 'info', kind: 'preview', envId: lease.envId, detail: 'public preview expired; successful up can reopen it with a fresh TTL' });
+    if (!Number.isFinite(deadline)) this.forgetPreview(leaseId, service);
+    if (!preview.pid) return;
+    await this.stopPreview(lease, service);
+    logEvent({ level: 'info', kind: 'preview', envId: lease.envId, detail: `public preview of '${service}' expired; successful up can reopen it with a fresh TTL` });
   }
 
-  /** Under the env lock, after a successful bind; never publish a private lease. */
+  /** Under the env lock, after a successful bind; never publish a private lease. Each service's preview is renewed or reopened on its own. */
   private async previewAfterUp(envId: string): Promise<string | undefined> {
-    this.renewPreview(envId);
+    this.renewPreviews(envId);
     const lease = this.journal.leaseForEnv(envId);
-    if (!lease?.previewRestore) return;
-    const gate = this.previewGates.get(lease.id);
-    if (lease.previewPid && sameProcess(lease.previewPid, lease.previewStart) && gate?.pid === lease.previewPid && gate.expiresAt > now()) return;
-    await this.restorePreview(lease, true, true);
-    const result = this.previewRestores.get(lease.id);
-    if (result?.state === 'failed') return `services are ready, but public preview could not be reopened: ${result.error}`;
+    if (!lease) return;
+    const notices: string[] = [];
+    for (const p of Object.values(lease.previews)) {
+      if (!p.restore) continue;
+      const key = previewKey(lease.id, p.service);
+      const gate = this.previewGates.get(key);
+      if (p.pid && sameProcess(p.pid, p.start) && gate?.pid === p.pid && gate.expiresAt > now()) continue;
+      await this.restorePreview(lease, p.service, true, true);
+      const result = this.previewRestores.get(key);
+      if (result?.state === 'failed') notices.push(`services are ready, but the public preview of '${p.service}' could not be reopened: ${result.error}`);
+    }
+    return notices.length ? notices.join('; ') : undefined;
   }
 
+  /**
+   * Re-publishing the leases' previews after a restart (decision 0045), per
+   * previewKey: in flight, or failed with the reason `ctx` reports. In memory:
+   * it describes this daemon life; `lease_previews` keeps what to re-publish.
+   */
   private previewRestores = new Map<string, { service: string; url: string; state: 'restoring' | 'failed'; error?: string; at: number }>();
   /** Settles once every recorded preview was re-published or reported; a restore that outlives a `shutdown` stops what it started. */
   previewsRestored: Promise<void> = Promise.resolve();
@@ -463,12 +482,15 @@ export class Engine {
     // The tunnel goes, the publication does not (decision 0045): the lease
     // still wants it, so it is published again below, once the public ports
     // are held. A row from before 0.20 says what it published only in its
-    // preview columns; that is recorded first.
+    // live fields; that is recorded first. Every service's preview of every
+    // lease is handled on its own (decision 0052).
     for (const lease of this.journal.allLeases()) {
-      if (lease.previewPid && !lease.previewRestore && lease.previewService && lease.previewUrl && lease.previewPort) {
-        this.journal.setLeasePreviewRestore(lease.id, { service: lease.previewService, url: lease.previewUrl, port: lease.previewPort });
+      for (const p of Object.values(lease.previews)) {
+        if (p.pid && !p.restore && p.url && p.port) {
+          this.journal.setLeasePreviewRestore(lease.id, p.service, { service: p.service, url: p.url, port: p.port });
+        }
+        if (p.pid) await this.stopPreview(lease, p.service);
       }
-      if (lease.previewPid) await this.stopPreviewForLease(lease);
     }
     logEvent({
       level: stranded ? 'warn' : 'info',
@@ -2281,6 +2303,43 @@ export class Engine {
     return env;
   }
 
+  /**
+   * What ctx, ps and status say about a lease's previews (decision 0052), one
+   * entry per service. A preview the restart is still re-publishing, or could
+   * not, reads as `restoring` / `failed` (decision 0045); one whose deadline
+   * passed as `expired` (decision 0047).
+   */
+  private previewViews(lease: LeaseRow | undefined) {
+    type View = { url: string | null; state: 'live' | 'restoring' | 'failed' | 'expired'; error?: string; expiresAt: number | null; ttlMs: number | null; publisher: string | null };
+    const previewUrls: Record<string, string> = {};
+    const previews: Record<string, View> = {};
+    let previewRestore: { service: string; url: string; state: 'restoring' | 'failed' | 'expired'; error?: string } | null = null;
+    if (!lease) return { previewUrls, previews, previewExpiresAt: null, previewRestore };
+    for (const p of Object.values(lease.previews).sort((a, b) => a.service.localeCompare(b.service))) {
+      const restoring = this.previewRestores.get(previewKey(lease.id, p.service));
+      const r = p.restore;
+      const expiresAt = r?.expiresAt ?? null;
+      const state: View['state'] = restoring
+        ? restoring.state
+        : p.pid
+          ? 'live'
+          : (expiresAt ?? 0) <= now() ? 'expired' : 'restoring';
+      const url = p.pid ? (p.url ?? null) : (restoring?.url ?? r?.url ?? null);
+      if (p.pid && p.url) previewUrls[p.service] = p.url;
+      previews[p.service] = {
+        url, state, ...(restoring?.error ? { error: restoring.error } : {}),
+        expiresAt, ttlMs: r?.ttlMs ?? null, publisher: r?.publisher ?? null,
+      };
+      if (!previewRestore && state !== 'live' && (restoring || r)) {
+        previewRestore = { service: p.service, url: restoring?.url ?? r?.url ?? '', state, ...(restoring?.error ? { error: restoring.error } : {}) };
+      }
+    }
+    const deadlines = Object.values(previews).map((v) => v.expiresAt).filter((d): d is number => d !== null);
+    const open = deadlines.filter((d) => d > now());
+    const previewExpiresAt = open.length ? Math.min(...open) : deadlines.length ? Math.max(...deadlines) : null;
+    return { previewUrls, previews, previewExpiresAt, previewRestore };
+  }
+
   ctx(cwd: string, holder?: string, envId?: string) {
     const stack = loadStack(cwd);
     const h = this.callerHolder(cwd, holder, stack);
@@ -2305,15 +2364,7 @@ export class Engine {
       if (activeSet && !activeSet.has(name)) continue;
       urls[name] = s.url;
     }
-    const previewUrls: Record<string, string> = {};
-    if (lease?.previewService && lease.previewUrl) previewUrls[lease.previewService] = lease.previewUrl;
-    // A preview the restart is still re-publishing, or could not (decision 0045).
-    const restoring = lease ? this.previewRestores.get(lease.id) : undefined;
-    const previewRestore = restoring
-      ? { service: restoring.service, url: restoring.url, state: restoring.state, ...(restoring.error ? { error: restoring.error } : {}) }
-      : lease?.previewRestore && !lease.previewPid
-        ? { service: lease.previewRestore.service, url: lease.previewRestore.url, state: (lease.previewRestore.expiresAt ?? 0) <= now() ? 'expired' as const : 'restoring' as const }
-        : null;
+    const { previewUrls, previews, previewExpiresAt, previewRestore } = this.previewViews(lease);
     return {
       stack: stack.manifest.name,
       envId: env.id,
@@ -2329,11 +2380,26 @@ export class Engine {
        * own readiness probes bypass it and are never counted.
        */
       proxy: this.proxy.stats(env.id),
+      /** Every live public preview of this lease, by service (decision 0052). */
       previewUrls,
-      previewExpiresAt: lease?.previewRestore?.expiresAt ?? null,
       /**
-       * A preview the daemon re-publishes after a restart (decision 0045):
-       * `restoring`, or `failed` with the error; null when there is none.
+       * Every preview of this lease by service (decision 0052): its URL, state
+       * (`live`, `restoring`, `failed` with the error, or `expired`), public
+       * access deadline and TTL. This is the per-service record; the scalar
+       * fields below summarise it for callers written for one preview.
+       */
+      previews,
+      /**
+       * Summary for one-preview callers: the earliest deadline among the
+       * previews still open, else the latest one that passed; null when the
+       * lease has no preview. Per service: `previews.<service>.expiresAt`.
+       */
+      previewExpiresAt,
+      /**
+       * Summary for one-preview callers (decision 0045): the first preview (by
+       * service name) that is not live — `restoring`, `failed` with the
+       * error, or `expired`; null when every preview is live or there is none.
+       * Per service: `previews.<service>`.
        */
       previewRestore,
       /**
@@ -2781,17 +2847,21 @@ export class Engine {
   private leasedPreviewPids(tagged: TaggedProc[]): Set<number> {
     const byPid = new Map(tagged.map((p) => [p.pid, p]));
     const groups = new Map<string, Set<number>>();
+    // Every service's tunnel of every lease (decision 0052): each is its own
+    // process group, verified against its own recorded leader.
     for (const lease of this.journal.allLeases()) {
-      if (lease.previewPid === undefined || lease.previewStart === undefined) continue;
-      const leader = byPid.get(lease.previewPid);
-      if (!leader || leader.envId !== lease.envId || leader.startTime !== lease.previewStart) continue;
-      const group = processGroup(leader.pid);
-      // Check identity after reading the group so an exited/reused leader
-      // cannot lend its replacement's process group to the old lease.
-      if (group === undefined || !sameProcess(leader.pid, lease.previewStart)) continue;
-      const owned = groups.get(lease.envId) ?? new Set<number>();
-      owned.add(group);
-      groups.set(lease.envId, owned);
+      for (const p of Object.values(lease.previews)) {
+        if (p.pid === undefined || p.start === undefined) continue;
+        const leader = byPid.get(p.pid);
+        if (!leader || leader.envId !== lease.envId || leader.startTime !== p.start) continue;
+        const group = processGroup(leader.pid);
+        // Check identity after reading the group so an exited/reused leader
+        // cannot lend its replacement's process group to the old lease.
+        if (group === undefined || !sameProcess(leader.pid, p.start)) continue;
+        const owned = groups.get(lease.envId) ?? new Set<number>();
+        owned.add(group);
+        groups.set(lease.envId, owned);
+      }
     }
     const pids = new Set<number>();
     for (const proc of tagged) {
@@ -2804,49 +2874,61 @@ export class Engine {
   }
 
   /**
-   * Stop and clear any lease-scoped preview tunnel recorded on this lease.
+   * Stop and clear one service's preview tunnel on this lease (decision 0052);
+   * the lease's other previews are left alone.
    *
    * Teardown may NEVER be blocked by a manifest edit: `preview.publisher` is
    * re-read from disk on every call, so a name that resolved at start can be a
    * typo by the time the sweeper gets here — and an unknown name throws a
    * work-error. Thrown from the sweeper's lease loop that aborted every tick,
    * so TTL expiry, dead-holder release and eviction stopped daemon-wide. The
-   * teardown path therefore falls back to the default publisher instead.
+   * teardown path therefore prefers the publisher the preview was published
+   * with and falls back to the default publisher.
    *
    * Returns false when the tunnel could NOT be confirmed dead. The record is
    * kept in that case (reapPids' contract): a forgotten preview pid is a
    * public, unauthenticated URL nobody can ever name again.
    */
-  private async stopPreviewForLease(lease: LeaseRow): Promise<boolean> {
-    const gate = this.previewGates.get(lease.id);
-    if (gate && gate.pid === lease.previewPid) { gate.close(); this.previewGates.delete(lease.id); }
-    if (!lease.previewPid) return true;
+  private async stopPreview(lease: LeaseRow, service: string): Promise<boolean> {
+    const p = lease.previews[service];
+    const key = previewKey(lease.id, service);
+    const gate = this.previewGates.get(key);
+    if (gate && gate.pid === p?.pid) { gate.close(); this.previewGates.delete(key); }
+    if (!p?.pid) return true;
     let pub = resolvePreviewPublisher(DEFAULT_PREVIEW_PUBLISHER);
-    const env = this.journal.getEnv(lease.envId);
-    if (env) {
-      try {
-        pub = resolvePreviewPublisher(this.previewPublisherName(loadStack(env.stackRoot)));
-      } catch {
-        /* stack root unreadable, or the manifest now names an unknown publisher — still reap the tunnel */
+    try {
+      if (p.restore?.publisher) pub = resolvePreviewPublisher(p.restore.publisher);
+      else {
+        const env = this.journal.getEnv(lease.envId);
+        if (env) pub = resolvePreviewPublisher(this.previewPublisherName(loadStack(env.stackRoot)));
       }
+    } catch {
+      /* stack root unreadable, or the manifest now names an unknown publisher — still reap the tunnel */
     }
     let stopped = false;
     try {
-      stopped = await pub.stop({ pid: lease.previewPid, startTime: lease.previewStart });
+      stopped = await pub.stop({ pid: p.pid, startTime: p.start });
     } catch (err) {
       logEvent({
         level: 'warn',
         kind: 'preview',
         envId: lease.envId,
-        detail: `stopping the preview tunnel failed: ${String((err as Error).message ?? err)}`,
+        detail: `stopping the preview tunnel of '${service}' failed: ${String((err as Error).message ?? err)}`,
       });
     }
     if (!stopped) {
-      logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: this.unreapedPreview(lease) });
+      logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: this.unreapedPreview(lease, service) });
       return false;
     }
-    this.journal.clearLeasePreview(lease.id, lease.previewPid);
+    this.journal.clearLeasePreview(lease.id, service, p.pid);
     return true;
+  }
+
+  /** Every live preview of the lease; false when any tunnel could not be confirmed dead. */
+  private async stopPreviews(lease: LeaseRow): Promise<boolean> {
+    let all = true;
+    for (const service of Object.keys(lease.previews)) if (!(await this.stopPreview(lease, service))) all = false;
+    return all;
   }
 
   /**
@@ -2857,23 +2939,24 @@ export class Engine {
    * the record is NOT recoverable. Name the pid and the public URL instead, so
    * the remedy survives the lease row that is usually about to be deleted.
    */
-  private unreapedPreview(lease: LeaseRow): string {
+  private unreapedPreview(lease: LeaseRow, service: string): string {
+    const p = lease.previews[service];
     const where = procScanSupported()
       ? `'runly pool gc' can still reclaim it by tag`
-      : `there is no tag scan on this platform — kill pid ${lease.previewPid} by hand`;
+      : `there is no tag scan on this platform — kill pid ${p?.pid} by hand`;
     return (
-      `the preview tunnel (pid ${lease.previewPid}) could not be confirmed dead —` +
-      ` ${lease.previewUrl ?? 'its public URL'} may still be serving, unauthenticated; ${where}`
+      `the preview tunnel of '${service}' (pid ${p?.pid}) could not be confirmed dead —` +
+      ` ${p?.url ?? 'its public URL'} may still be serving, unauthenticated; ${where}`
     );
   }
 
   /**
-   * Release a lease and reap its preview tunnel first.
+   * Release a lease and reap its preview tunnels first.
    *
    * Re-read between the stop and the delete. `release` and the sweeper hold no
    * env lock, and the stop blocks in `killGroupVerified` for up to ~4s — long
    * enough for a concurrent `preview` to take the env lock, publish, and write
-   * its pid onto this very row. Deleting the row on the strength of the old
+   * its pid onto this very lease. Deleting the row on the strength of the old
    * snapshot then orphaned the NEW tunnel: no lease names it, `pool gc` skips
    * nothing it can see, and `preview stop` has nothing left to stop. Taking the
    * env lock here instead would nest it inside the pool lock (tryClaim calls
@@ -2881,23 +2964,30 @@ export class Engine {
    */
   private async endLease(lease: LeaseRow): Promise<void> {
     let row: LeaseRow | undefined = lease;
-    for (let attempt = 0; attempt < 4 && row?.previewPid; attempt++) {
-      const stopped = row.previewPid;
-      await this.stopPreviewForLease(row);
+    for (let attempt = 0; attempt < 4 && row && livePreviews(row).length > 0; attempt++) {
+      const stopped = new Map(livePreviews(row).map((p) => [p.service, p.pid]));
+      await this.stopPreviews(row);
       const fresh = this.journal.leaseForEnv(lease.envId);
-      if (!fresh || fresh.id !== lease.id || fresh.previewPid === stopped) break;
+      if (!fresh || fresh.id !== lease.id) break;
+      // Another pass only for what was published meanwhile; a tunnel that
+      // outlived its kill is still recorded, and reported below.
+      if (livePreviews(fresh).every((p) => stopped.get(p.service) === p.pid)) break;
       row = fresh;
     }
     const last = this.journal.leaseForEnv(lease.envId);
-    if (last?.id === lease.id && last.previewPid) {
-      logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: this.unreapedPreview(last) });
+    if (last?.id === lease.id) {
+      for (const p of livePreviews(last)) logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: this.unreapedPreview(last, p.service) });
     }
-    clearTimeout(this.previewTimers.get(lease.id));
-    this.previewTimers.delete(lease.id);
+    const prefix = previewKey(lease.id, '');
+    for (const [key, timer] of this.previewTimers) {
+      if (!key.startsWith(prefix)) continue;
+      clearTimeout(timer);
+      this.previewTimers.delete(key);
+    }
     this.journal.deleteLease(lease.id);
     this.leaseInputs.delete(lease.id);
     this.goneSince.delete(`lease:${lease.id}`);
-    this.previewRestores.delete(lease.id);
+    for (const key of [...this.previewRestores.keys()]) if (key.startsWith(prefix)) this.previewRestores.delete(key);
   }
 
   /**
@@ -2934,110 +3024,143 @@ export class Engine {
   }
 
   /**
+   * Two services of one lease must never be pinned to the same address
+   * (decision 0052): the second publish would take over the first's. The
+   * publisher says what its settings pin (`claim`); a preview that only waits
+   * for a successful `up` to reopen it still holds its claim. A work-error,
+   * like a pinned port someone else serves: the request asks for something
+   * this lease already uses.
+   */
+  private assertPreviewClaimFree(pub: PreviewPublisher, lease: LeaseRow, service: string, settings: PreviewSettings | undefined): void {
+    const mine = pub.claim?.(settings);
+    if (!mine) return;
+    for (const p of Object.values(lease.previews)) {
+      if (p.service === service || !p.restore || (p.restore.publisher ?? pub.name) !== pub.name) continue;
+      if (pub.claim?.(p.restore.settings as PreviewSettings | undefined) !== mine) continue;
+      throw new BrokerError(
+        'work-error',
+        `${mine} is already pinned by this lease's preview of '${p.service}' — two services cannot share it; ` +
+          `publish '${service}' with another --https-port, or 'runly preview stop ${p.service}' first`,
+        'preview',
+      );
+    }
+  }
+
+  /**
    * Publish every recorded preview again after a restart (decision 0045): same
    * publisher, the settings that pin its address, aimed at the same public
    * port — which the proxy holds again, so the first request wakes the
-   * service as usual. A failure is an event and `ctx.previewRestore`, never
-   * an error of anyone's verb.
+   * service as usual. Each service's preview on its own (decision 0052). A
+   * failure is an event and `ctx.previews.<service>`, never an error of
+   * anyone's verb.
    */
   private async restorePreviews(): Promise<void> {
-    const pending = this.journal.allLeases().filter((l) => l.previewRestore && !l.previewPid);
-    await Promise.allSettled(pending.map((l) => this.restorePreview(l)));
+    const pending = this.journal.allLeases().flatMap((l) =>
+      Object.values(l.previews).filter((p) => p.restore && !p.pid).map((p) => [l, p.service] as const));
+    await Promise.allSettled(pending.map(([l, service]) => this.restorePreview(l, service)));
   }
 
-  private async restorePreview(lease: LeaseRow, reopen = false, alreadyLocked = false): Promise<void> {
+  private async restorePreview(lease: LeaseRow, service: string, reopen = false, alreadyLocked = false): Promise<void> {
     const reason = reopen ? 'after successful up' : 'after the daemon restart';
-    const r = lease.previewRestore;
+    const key = previewKey(lease.id, service);
+    const r = lease.previews[service]?.restore;
     if (!r) return;
-    if (!Number.isFinite(r.expiresAt) || (!reopen && (r.expiresAt ?? 0) <= now())) { await this.expirePreview(lease.id); return; }
-    if (!reopen) this.armPreview(lease.id, (r.expiresAt ?? 0));
-    this.previewRestores.set(lease.id, { service: r.service, url: r.url, state: 'restoring', at: now() });
+    if (!Number.isFinite(r.expiresAt) || (!reopen && (r.expiresAt ?? 0) <= now())) { await this.expirePreview(lease.id, service); return; }
+    if (!reopen) this.armPreview(lease.id, service, (r.expiresAt ?? 0));
+    this.previewRestores.set(key, { service, url: r.url, state: 'restoring', at: now() });
     try {
       const restore = async () => {
         // Re-read inside the lock: a `preview` or `preview stop` that ran
-        // first decides, and a lease that ended takes its preview with it.
+        // first decides, and a lease that ended takes its previews with it.
         const held = this.journal.leaseForEnv(lease.envId);
-        if (this.stopping || !held || held.id !== lease.id || !held.previewRestore || (!reopen && held.previewPid)) {
-          this.previewRestores.delete(lease.id);
+        const heldPreview = held?.previews[service];
+        if (this.stopping || !held || held.id !== lease.id || !heldPreview?.restore || (!reopen && heldPreview.pid)) {
+          this.previewRestores.delete(key);
           return;
         }
-        let want = held.previewRestore;
+        let want = heldPreview.restore;
         if (reopen) {
-          if (!(await this.stopPreviewForLease(held))) throw new BrokerError('infra-error', this.unreapedPreview(held), 'preview');
+          if (!(await this.stopPreview(held, service))) throw new BrokerError('infra-error', this.unreapedPreview(held, service), 'preview');
           const fresh = this.journal.leaseForEnv(lease.envId);
-          if (!fresh || fresh.id !== held.id || !fresh.previewRestore) return;
-          const ttlMs = fresh.previewRestore.ttlMs ?? 30 * 60_000;
+          const freshRestore = fresh?.previews[service]?.restore;
+          if (!fresh || fresh.id !== held.id || !freshRestore) {
+            this.previewRestores.delete(key);
+            return;
+          }
+          const ttlMs = freshRestore.ttlMs ?? 30 * 60_000;
           if (!Number.isFinite(ttlMs) || ttlMs <= 0 || !Number.isSafeInteger(Math.ceil(now() + ttlMs))) throw new BrokerError('work-error', 'invalid stored preview TTL; publish the preview again', 'preview');
-          want = { ...fresh.previewRestore, ttlMs, expiresAt: now() + ttlMs };
-          this.journal.setLeasePreviewRestore(held.id, want);
-          this.armPreview(held.id, want.expiresAt ?? 0);
+          want = { ...freshRestore, ttlMs, expiresAt: now() + ttlMs };
+          this.journal.setLeasePreviewRestore(held.id, service, want);
+          this.armPreview(held.id, service, want.expiresAt ?? 0);
         }
         const env = this.journal.getEnv(held.envId);
         if (!env || env.state === 'recycling') {
-          this.previewRestores.delete(lease.id);
+          this.previewRestores.delete(key);
           return;
         }
         const stack = loadStack(env.stackRoot);
         this.assertPreviewAllowed(stack);
-        const port = this.previewTarget(env, stack, want.service);
+        const port = this.previewTarget(env, stack, service);
         if (port !== want.port) {
-          throw new BrokerError('env-error', `service '${want.service}' is on port ${port} now, not ${want.port}, which its preview was published for`, 'preview');
+          throw new BrokerError('env-error', `service '${service}' is on port ${port} now, not ${want.port}, which its preview was published for`, 'preview');
         }
         const pub = resolvePreviewPublisher(want.publisher ?? this.previewPublisherName(stack));
         pub.checkPrerequisite();
         const settings = (want.settings ?? stack.manifest.preview) as PreviewSettings | undefined;
         const gate = await PreviewGate.open(port, (want.expiresAt ?? 0));
-        this.previewGates.set(held.id, gate);
+        this.previewGates.set(key, gate);
         let published;
-        try { published = await pub.start({ envId: env.id, service: want.service, localUrl: gate.url, logDir: this.envDirs(env.id).logs, settings }); }
+        try { published = await pub.start({ envId: env.id, service, localUrl: gate.url, logDir: this.envDirs(env.id).logs, settings }); }
         catch (err) { gate.close(); throw err; }
         const { url, pid, pinned } = published;
         gate.pid = pid.pid;
         const fresh = this.journal.leaseForEnv(env.id);
-        if (!fresh || fresh.id !== lease.id || this.stopping || (want.expiresAt ?? 0) <= now() || !fresh.previewRestore) {
+        if (!fresh || fresh.id !== lease.id || this.stopping || (want.expiresAt ?? 0) <= now() || !fresh.previews[service]?.restore) {
           gate.close();
-          if (!(await pub.stop(pid))) logEvent({ level: 'error', kind: 'preview', envId: env.id, detail: `the lease ended while its preview was being restored, and the new tunnel (pid ${pid.pid}) outlived its kill — ${url} may still be serving, unauthenticated` });
-          this.previewRestores.delete(lease.id);
+          if (!(await pub.stop(pid))) logEvent({ level: 'error', kind: 'preview', envId: env.id, detail: `the lease ended while the preview of '${service}' was being restored, and the new tunnel (pid ${pid.pid}) outlived its kill — ${url} may still be serving, unauthenticated` });
+          this.previewRestores.delete(key);
           return;
         }
-        fresh.previewService = want.service;
-        fresh.previewUrl = url;
-        fresh.previewPid = pid.pid;
-        fresh.previewStart = pid.startTime;
-        fresh.previewPort = port;
-        this.journal.saveLease(fresh);
-        this.journal.setLeasePreviewRestore(fresh.id, { ...want, url, publisher: pub.name, settings: { ...(settings ?? {}), ...(pinned ?? {}) } });
-        this.previewRestores.delete(lease.id);
+        this.journal.setLeasePreview(fresh.id, service, { url, pid: pid.pid, start: pid.startTime, port });
+        this.journal.setLeasePreviewRestore(fresh.id, service, { ...want, url, publisher: pub.name, settings: { ...(settings ?? {}), ...(pinned ?? {}) } });
+        this.previewRestores.delete(key);
         logEvent({
           level: url === want.url ? 'info' : 'warn',
           kind: 'preview',
           envId: env.id,
           detail: url === want.url
-            ? `restored the preview of '${want.service}' at ${url} ${reason}`
-            : `restored the preview of '${want.service}' ${reason} at a NEW address ${url} (was ${want.url}) — ${pub.name} cannot keep its address`,
+            ? `restored the preview of '${service}' at ${url} ${reason}`
+            : `restored the preview of '${service}' ${reason} at a NEW address ${url} (was ${want.url}) — ${pub.name} cannot keep its address`,
         });
       };
       if (alreadyLocked) await restore();
       else await this.envLocked(lease.envId, restore, undefined, 'a preview restore');
     } catch (err) {
-      if ((!reopen && (r.expiresAt ?? 0) <= now()) || !this.journal.leaseForEnv(lease.envId)?.previewRestore) {
-        this.previewRestores.delete(lease.id);
+      if ((!reopen && (r.expiresAt ?? 0) <= now()) || !this.journal.leaseForEnv(lease.envId)?.previews[service]?.restore) {
+        this.previewRestores.delete(key);
         return;
       }
       const error = String((err as Error).message ?? err);
-      this.previewRestores.set(lease.id, { service: r.service, url: r.url, state: 'failed', error, at: now() });
-      logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: `could not restore the preview of '${r.service}' (${r.url}) ${reason}: ${error} — run 'runly preview ${r.service}' to publish it again` });
+      this.previewRestores.set(key, { service, url: r.url, state: 'failed', error, at: now() });
+      logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: `could not restore the preview of '${service}' (${r.url}) ${reason}: ${error} — run 'runly preview ${service}' to publish it again` });
     }
   }
 
-  /** The lease's preview is over on purpose: a restart must not bring it back (decision 0045). */
-  private forgetPreview(leaseId: string): void {
-    clearTimeout(this.previewTimers.get(leaseId));
-    this.previewTimers.delete(leaseId);
-    this.journal.setLeasePreviewRestore(leaseId, null);
-    this.previewRestores.delete(leaseId);
+  /** This service's preview is over on purpose: a restart or an `up` must not bring it back (decisions 0045, 0052). */
+  private forgetPreview(leaseId: string, service: string): void {
+    const key = previewKey(leaseId, service);
+    clearTimeout(this.previewTimers.get(key));
+    this.previewTimers.delete(key);
+    this.journal.setLeasePreviewRestore(leaseId, service, null);
+    this.previewRestores.delete(key);
   }
 
+  /**
+   * `runly preview <service>`: add or renew THIS service's preview on the
+   * lease (decision 0052). Previews of the lease's other services are not
+   * touched; re-publishing the same service replaces its tunnel (the same
+   * address where the publisher can keep one) with a fresh deadline.
+   */
   async previewStart(cwd: string, service: string, holder?: string, ttlMs?: number, httpsPort?: number): Promise<{ service: string; url: string; expiresAt: number }> {
     const duration = ttlMs ?? 30 * 60_000;
     if (!Number.isFinite(duration) || duration <= 0 || !Number.isSafeInteger(Math.ceil(now() + duration))) throw new BrokerError('work-error', 'preview --ttl must be a finite positive duration', 'preview');
@@ -3053,6 +3176,10 @@ export class Engine {
     this.previewTarget(this.envForLease(lease), stack, service);
     const env = this.assertUsable(this.envForLease(lease).id);
     const pub = resolvePreviewPublisher(this.previewPublisherName(stack));
+    // A caller's --https-port outranks the manifest for this publish only;
+    // publishers that do not serve on a port ignore it (decision 0031).
+    const settings: PreviewSettings | undefined = httpsPort !== undefined ? { ...stack.manifest.preview, https_port: httpsPort } : stack.manifest.preview;
+    const key = previewKey(lease.id, service);
     return this.envLocked(env.id, async () => {
       // Re-read INSIDE the lock. `lease` was resolved before queueing, so a
       // publish that ran while we waited has already replaced the pid it names;
@@ -3074,32 +3201,31 @@ export class Engine {
       // run inside `pub.start`, so a cloudflared that went missing since the
       // last publish killed the working tunnel and then failed, leaving the
       // caller with no preview and an error that reads as if nothing happened.
+      // The same goes for an address another service of this lease pins.
       pub.checkPrerequisite();
+      this.assertPreviewClaimFree(pub, held, service, settings);
       // Publishing over an unconfirmed pid would overwrite the only record of a
-      // tunnel that may still be serving — the exact loss stopPreviewForLease
-      // keeps the row to prevent.
-      if (!(await this.stopPreviewForLease(held))) {
-        throw new BrokerError('infra-error', this.unreapedPreview(held), 'preview');
+      // tunnel that may still be serving — the exact loss stopPreview keeps the
+      // row to prevent. Only THIS service's tunnel is replaced.
+      if (!(await this.stopPreview(held, service))) {
+        throw new BrokerError('infra-error', this.unreapedPreview(held, service), 'preview');
       }
       const dirs = this.envDirs(env.id);
-      const settings: PreviewSettings | undefined = httpsPort !== undefined ? { ...stack.manifest.preview, https_port: httpsPort } : stack.manifest.preview;
       const expiresAt = now() + duration;
       const gate = await PreviewGate.open(localPort, expiresAt);
-      this.previewGates.set(held.id, gate);
+      this.previewGates.set(key, gate);
       let published;
       try { published = await pub.start({
         envId: env.id,
         service,
-        // `localhost`, the same origin ctx advertises for the service — never a
-        // literal 127.0.0.1. Node 17+ resolves `localhost` to ::1 first, so a dev
-        // server bound to `localhost` (ng serve, vite) often listens on [::1]
-        // ONLY, and a tunnel aimed at 127.0.0.1 then answers 502 for a service
-        // that is perfectly up. Both cloudflared and tailscale resolve
-        // `localhost` to whichever loopback is listening.
+        // The gate's `localhost` origin, never a literal 127.0.0.1. Node 17+
+        // resolves `localhost` to ::1 first, so a dev server bound to
+        // `localhost` (ng serve, vite) often listens on [::1] ONLY, and a
+        // tunnel aimed at 127.0.0.1 then answers 502 for a service that is
+        // perfectly up. Both cloudflared and tailscale resolve `localhost` to
+        // whichever loopback is listening.
         localUrl: gate.url,
         logDir: dirs.logs,
-        // A caller's --https-port outranks the manifest for this publish only;
-        // publishers that do not serve on a port ignore it (decision 0031).
         settings,
       });
       } catch (err) { gate.close(); throw err; }
@@ -3118,7 +3244,7 @@ export class Engine {
             level: 'error',
             kind: 'preview',
             envId: env.id,
-            detail: `the lease lapsed mid-publish and the new tunnel (pid ${pid.pid}) outlived its kill — ${url} may still be serving, unauthenticated`,
+            detail: `the lease lapsed mid-publish and the new tunnel of '${service}' (pid ${pid.pid}) outlived its kill — ${url} may still be serving, unauthenticated`,
           });
         }
         throw new BrokerError(
@@ -3127,24 +3253,25 @@ export class Engine {
           'lease',
         );
       }
-      freshLease.previewService = service;
-      freshLease.previewUrl = url;
-      freshLease.previewPid = pid.pid;
-      freshLease.previewStart = pid.startTime;
-      freshLease.previewPort = localPort;
-      this.journal.saveLease(freshLease);
+      this.journal.setLeasePreview(freshLease.id, service, { url, pid: pid.pid, start: pid.startTime, port: localPort });
       // What a daemon restart publishes again (decision 0045).
       const restore: PreviewRestore = { expiresAt, ttlMs: duration, service, url, port: localPort, publisher: pub.name, settings: { ...(settings ?? {}), ...(pinned ?? {}) } };
-      this.journal.setLeasePreviewRestore(freshLease.id, restore);
-      this.armPreview(freshLease.id, expiresAt);
-      this.previewRestores.delete(freshLease.id);
+      this.journal.setLeasePreviewRestore(freshLease.id, service, restore);
+      this.armPreview(freshLease.id, service, expiresAt);
+      this.previewRestores.delete(key);
       this.touch(env.id);
       logEvent({ level: 'info', kind: 'preview', envId: env.id, detail: `published '${service}' at ${url}` });
       return { service, url, expiresAt };
     }, undefined, 'a preview publish');
   }
 
-  async previewStop(cwd: string, holder?: string): Promise<{ stopped: boolean; service?: string }> {
+  /**
+   * `runly preview stop [<service>]` (decision 0052): with a service, stop that
+   * service's preview only; without, every preview of the lease. A preview a
+   * restart could not bring back, or one that expired, is still on record:
+   * stopping it means it stays down — a later `up` no longer reopens it.
+   */
+  async previewStop(cwd: string, holder?: string, service?: string): Promise<{ stopped: boolean; service?: string; services: string[] }> {
     const stack = loadStack(cwd);
     const h = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(h, stack.id);
@@ -3156,21 +3283,28 @@ export class Engine {
     // had just written, losing the new tunnel.
     return this.envLocked(lease.envId, async () => {
       const held = this.journal.leaseForHolder(h, stack.id);
-      if (!held || held.id !== lease.id) return { stopped: false };
-      if (!held.previewPid) {
-        // A preview a restart could not bring back is still on record: stopping
-        // it means it stays down.
-        const pending = held.previewRestore;
-        this.forgetPreview(held.id);
-        return pending ? { stopped: true, service: pending.service } : { stopped: false };
+      if (!held || held.id !== lease.id) return { stopped: false, services: [] };
+      // A service the manifest no longer declares can still have a preview on
+      // record, and stopping it must work; a name that is neither is a typo.
+      if (service !== undefined && !held.previews[service] && !(service in stack.manifest.services)) {
+        throw new BrokerError('work-error', `no service '${service}' in ${manifestFileOf(stack)}`, 'manifest');
       }
-      const service = held.previewService;
-      if (!(await this.stopPreviewForLease(held))) {
-        throw new BrokerError('infra-error', this.unreapedPreview(held), 'preview');
+      const targets = service !== undefined ? [service] : Object.keys(held.previews);
+      const stopped: string[] = [];
+      const unreaped: string[] = [];
+      for (const s of targets) {
+        const p = held.previews[s];
+        if (!p) continue;
+        if (p.pid && !(await this.stopPreview(held, s))) {
+          unreaped.push(this.unreapedPreview(held, s));
+          continue;
+        }
+        this.forgetPreview(held.id, s);
+        if (p.pid) logEvent({ level: 'info', kind: 'preview', envId: held.envId, detail: `stopped preview for '${s}'` });
+        stopped.push(s);
       }
-      this.forgetPreview(held.id);
-      logEvent({ level: 'info', kind: 'preview', envId: held.envId, detail: `stopped preview for '${service ?? 'unknown'}'` });
-      return { stopped: true, service };
+      if (unreaped.length) throw new BrokerError('infra-error', unreaped.join('; '), 'preview');
+      return { stopped: stopped.length > 0, ...(stopped[0] !== undefined ? { service: stopped[0] } : {}), services: stopped };
     }, undefined, 'a preview stop');
   }
 
@@ -3578,6 +3712,7 @@ export class Engine {
       const stats = this.proxy.stats(env.id);
       const wanted = stack ? this.desiredServices(stack, env) : new Set(env.activeServices ?? Object.keys(env.servicePids));
       const lease = this.journal.leaseForEnv(env.id);
+      const previews = this.previewViews(lease).previews;
       const names = stack ? Object.keys(stack.manifest.services) : [...new Set([...Object.keys(env.servicePids), ...wanted])];
       for (const name of names) {
         const key = stack?.manifest.services[name]?.port;
@@ -3612,6 +3747,8 @@ export class Engine {
           failure: failure
             ? { reason: failure.reason, exitCode: failure.code, signal: failure.signal, at: failure.at, detail: describeExit(failure), hint: `runly logs ${name}` }
             : null,
+          /** This service's public preview on the lease (decision 0052), as `ctx.previews` reports it; null when none. */
+          preview: previews[name] ?? null,
           holder: lease?.holder ?? null,
           busy: this.busy.has(env.id) ? (this.busyOp.get(env.id) ?? 'an operation') : null,
         });
@@ -3951,6 +4088,8 @@ export class Engine {
         /** Where its services run: the caller's worktree (decision 0032). */
         worktree: e.stackRoot,
         lease: lease ? { ...lease, expiresAt: lease.expiresAt === NO_LEASE_EXPIRY ? null : lease.expiresAt } : null,
+        /** The lease's public previews by service (decision 0052), as `ctx.previews` reports them. */
+        previews: this.previewViews(lease ?? undefined).previews,
         /** null = every service (the default set); otherwise the services the lease wants up — [] after `runly down` (decision 0034). */
         activeServices: e.activeServices ?? null,
         idleMs: now() - e.lastUsedAt,
@@ -4364,20 +4503,25 @@ export class Engine {
   private async enforcePreviewForbidden(env: EnvRow, stack: Stack, say: Progress): Promise<string | undefined> {
     if (!stack.manifest.preview?.forbidden) return undefined;
     const lease = this.journal.leaseForEnv(env.id);
-    if (!lease || (!lease.previewPid && !lease.previewRestore)) return undefined;
-    const url = lease.previewUrl ?? 'the preview tunnel';
-    const confirmed = await this.stopPreviewForLease(lease);
-    this.forgetPreview(lease.id);
-    const detail = confirmed
-      ? `work-error: ${manifestFileOf(stack)} now sets preview.forbidden, and a stack that forbids preview must not stay published — ${url} has been torn down`
-      : `work-error: ${manifestFileOf(stack)} now sets preview.forbidden but the tunnel could NOT be confirmed dead — ${url} may still be serving, unauthenticated`;
+    if (!lease || Object.keys(lease.previews).length === 0) return undefined;
+    // Every service's preview goes (decision 0052): the flag is about the stack.
+    const details: string[] = [];
+    for (const p of Object.values(lease.previews)) {
+      const url = p.url ?? 'the preview tunnel';
+      const confirmed = await this.stopPreview(lease, p.service);
+      this.forgetPreview(lease.id, p.service);
+      details.push(confirmed
+        ? `work-error: ${manifestFileOf(stack)} now sets preview.forbidden, and a stack that forbids preview must not stay published — ${url} ('${p.service}') has been torn down`
+        : `work-error: ${manifestFileOf(stack)} now sets preview.forbidden but the tunnel of '${p.service}' could NOT be confirmed dead — ${url} may still be serving, unauthenticated`);
+    }
+    const detail = details.join('; ');
     logEvent({ level: 'error', kind: 'preview', envId: env.id, detail });
     say(detail);
     return detail;
   }
 
   /**
-   * Reconcile a live preview against the environment this bind just produced.
+   * Reconcile each live preview against the environment this bind just produced.
    *
    * The tunnel outlives service restarts, so everything here is about what is
    * now BEHIND the unchanged public URL. Three outcomes invalidate it outright
@@ -4385,7 +4529,8 @@ export class Engine {
    * service is no longer wanted (`runly down`, decision 0034), or it moved to a different local
    * port (a renamed port key; existing keys are never reassigned, decision
    * 0004). A data reset does not: the tunnel keeps serving, which is precisely
-   * why it has to be said out loud.
+   * why it has to be said out loud. Each service's preview is judged on its
+   * own (decision 0052): `down api` ends the preview of `api`, never `web`'s.
    *
    * Runs at the bind's EPILOGUE, once the shape it judges against is committed.
    * From the top of the bind it was reading a REQUESTED slice that the epilogue
@@ -4416,40 +4561,44 @@ export class Engine {
     opts: { hygiene: Hygiene; portsReallocated: boolean },
   ): Promise<string | undefined> {
     const lease = this.journal.leaseForEnv(env.id);
-    if (!lease || (!lease.previewPid && !lease.previewRestore)) return undefined;
-    const service = lease.previewService ?? lease.previewRestore?.service;
-    if (!service) return undefined;
-    const url = lease.previewUrl ?? 'the preview tunnel';
-    const portKey = stack.manifest.services[service]?.port;
-    const port = portKey ? env.ports[portKey] : undefined;
+    if (!lease) return undefined;
+    const details: string[] = [];
+    for (const p of Object.values(lease.previews)) {
+      const service = p.service;
+      const url = p.url ?? 'the preview tunnel';
+      const portKey = stack.manifest.services[service]?.port;
+      const port = portKey ? env.ports[portKey] : undefined;
+      const recordedPort = p.port ?? p.restore?.port;
 
-    const cause = stack.manifest.preview?.forbidden
-      ? { klass: 'work-error', why: `${manifestFileOf(stack)} now sets preview.forbidden, and a stack that forbids preview must not stay published` }
-      : !active.has(service)
-        ? { klass: 'env-error', why: `service '${service}' is not in this bind's running set${active.size ? ` (${[...active].map((n) => `'${n}'`).join(', ')})` : ' (this lease runs no services)'}, so its preview would publish a port with nothing behind it for the rest of the lease` }
-        : opts.portsReallocated && port !== (lease.previewPort ?? lease.previewRestore?.port)
-          ? { klass: 'env-error', why: `service '${service}' moved from port ${lease.previewPort} to ${port ?? 'no port at all'}, so its preview tunnel is aimed at a stale port` }
-          : null;
+      const cause = stack.manifest.preview?.forbidden
+        ? { klass: 'work-error', why: `${manifestFileOf(stack)} now sets preview.forbidden, and a stack that forbids preview must not stay published` }
+        : !active.has(service)
+          ? { klass: 'env-error', why: `service '${service}' is not in this bind's running set${active.size ? ` (${[...active].map((n) => `'${n}'`).join(', ')})` : ' (this lease runs no services)'}, so its preview would publish a port with nothing behind it for the rest of the lease` }
+          : opts.portsReallocated && port !== recordedPort
+            ? { klass: 'env-error', why: `service '${service}' moved from port ${recordedPort} to ${port ?? 'no port at all'}, so its preview tunnel is aimed at a stale port` }
+            : null;
 
-    if (cause) {
-      const confirmed = await this.stopPreviewForLease(lease);
-      this.forgetPreview(lease.id);
-      const detail = confirmed
-        ? `${cause.klass}: ${cause.why} — ${url} has been torn down; run 'runly preview ${service}' again for a new URL`
-        : `${cause.klass}: ${cause.why}, and the tunnel could NOT be confirmed dead — ${url} may still be serving, unauthenticated`;
-      logEvent({ level: 'error', kind: 'preview', envId: env.id, detail });
-      say(detail);
-      return detail;
+      if (cause) {
+        const confirmed = await this.stopPreview(lease, service);
+        this.forgetPreview(lease.id, service);
+        const detail = confirmed
+          ? `${cause.klass}: ${cause.why} — ${url} has been torn down; run 'runly preview ${service}' again for a new URL`
+          : `${cause.klass}: ${cause.why}, and the tunnel could NOT be confirmed dead — ${url} may still be serving, unauthenticated`;
+        logEvent({ level: 'error', kind: 'preview', envId: env.id, detail });
+        say(detail);
+        details.push(detail);
+        continue;
+      }
+      if (opts.hygiene !== 'reuse') {
+        const detail =
+          `the preview tunnel for '${service}' is still published at ${url} — this ${opts.hygiene} bind replaced the data behind it,` +
+          ` so that PUBLIC, unauthenticated URL now serves different content. Run 'runly preview stop ${service}' if that must not be visible.`;
+        logEvent({ level: 'warn', kind: 'preview', envId: env.id, detail });
+        say(detail);
+        details.push(detail);
+      }
     }
-    if (opts.hygiene !== 'reuse') {
-      const detail =
-        `the preview tunnel for '${service}' is still published at ${url} — this ${opts.hygiene} bind replaced the data behind it,` +
-        ` so that PUBLIC, unauthenticated URL now serves different content. Run 'runly preview stop' if that must not be visible.`;
-      logEvent({ level: 'warn', kind: 'preview', envId: env.id, detail });
-      say(detail);
-      return detail;
-    }
-    return undefined;
+    return details.length ? details.join('; ') : undefined;
   }
 
   /**
@@ -4489,7 +4638,7 @@ export class Engine {
     // preview tunnel with it — so the tunnel has to be reaped here, while it can
     // still be named. Teardown outranks the lease: --force is what took it.
     const lease = this.journal.leaseForEnv(env.id);
-    if (lease?.previewPid) await this.stopPreviewForLease(lease);
+    if (lease) await this.stopPreviews(lease);
     const survivors = await this.supervisor(env).stopAll();
     this.supervisors.delete(env.id);
     // After a daemon restart the in-memory supervisor is EMPTY, so stopAll is a
@@ -5254,7 +5403,14 @@ export class Engine {
         });
         continue;
       }
-      if (lease.previewRestore && (!Number.isFinite(lease.previewRestore.expiresAt) || (lease.previewRestore.expiresAt ?? 0) <= now())) { await this.expirePreview(lease.id); continue; }
+      // Each service's preview has its own deadline (decisions 0047, 0052).
+      const expired = new Set<string>();
+      for (const p of Object.values(lease.previews)) {
+        if (p.restore && (!Number.isFinite(p.restore.expiresAt) || (p.restore.expiresAt ?? 0) <= now())) {
+          expired.add(p.service);
+          await this.expirePreview(lease.id, p.service);
+        }
+      }
       // Never expire a lease whose env has an operation in flight (a long bind
       // under a tiny TTL must not lose its env mid-bind).
       if (this.busy.has(lease.envId)) continue;
@@ -5263,20 +5419,15 @@ export class Engine {
       // kept advertising a URL that had stopped answering an hour earlier, and
       // `preview stop` reported success for a corpse. Below the busy guard: a
       // publish in flight has already killed the pid this row still names.
-      if (lease.previewPid && !sameProcess(lease.previewPid, lease.previewStart)) {
-        const service = lease.previewService ?? 'unknown';
-        this.journal.clearLeasePreview(lease.id, lease.previewPid);
-        this.forgetPreview(lease.id);
-        lease.previewPid = undefined;
-        lease.previewStart = undefined;
-        lease.previewUrl = undefined;
-        lease.previewService = undefined;
-        lease.previewPort = undefined;
+      for (const p of livePreviews(lease)) {
+        if (expired.has(p.service) || p.pid === undefined || sameProcess(p.pid, p.start)) continue;
+        this.journal.clearLeasePreview(lease.id, p.service, p.pid);
+        this.forgetPreview(lease.id, p.service);
         logEvent({
           level: 'warn',
           kind: 'preview',
           envId: lease.envId,
-          detail: `the preview tunnel for '${service}' exited on its own — its URL is no longer published; run 'runly preview ${service}' again for a new one`,
+          detail: `the preview tunnel for '${p.service}' exited on its own — its URL is no longer published; run 'runly preview ${p.service}' again for a new one`,
         });
       }
 
@@ -5325,9 +5476,7 @@ export class Engine {
     // published, unauthenticated URL once this process is gone, and the reap can
     // no longer ride on the service reap below — the tunnel outlives service
     // restarts by design now.
-    for (const lease of this.journal.allLeases()) {
-      if (lease.previewPid) await this.stopPreviewForLease(lease);
-    }
+    for (const lease of this.journal.allLeases()) await this.stopPreviews(lease);
     const survivors = new Map<string, Record<string, ServicePid>>();
     for (const [id, sup] of this.supervisors) survivors.set(id, await sup.stopAll());
     for (const env of this.journal.allEnvs()) {

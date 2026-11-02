@@ -113,20 +113,29 @@ They reach services and readiness probes, not builds, upkeep or `exec`.
 
 Cloudflare URLs are unauthenticated unless you add access controls; Tailscale access follows your tailnet policy. A stable hostname does not extend its access deadline.
 
-`runly preview <service>` publishes one service of your lease; `preview stop`
-ends it and clears reopening intent. Public access expires after 30 minutes
+`runly preview <service>` publishes a service of your lease. Each service has
+its own preview, tunnel and deadline: publishing `api` leaves the preview of
+`web` alone, and publishing `web` again renews it. `preview stop <service>`
+ends one and clears its reopening intent; `preview stop` ends all of them.
+Public access expires after 30 minutes
 (or `preview --ttl <minutes>`), including open streams. Idle stops and service
-restarts preserve the tunnel within its deadline. Successful `up` renews it,
-or republishes an automatically expired preview for its saved duration;
+restarts preserve the tunnel within its deadline. Successful `up` renews each live
+preview, or republishes an automatically expired one for its saved duration;
 `release` and teardown end publication. A daemon restart (a crash,
 `daemon stop`, an update) restores only unexpired access once the daemon holds
 the ports, without extending its deadline, with the same
 publisher and, where the publisher can pin it, the same address
 (`cloudflare-quick` gets a new name); the service wakes on the first request.
-`ctx` shows `previewRestore` while that runs, or with the error when it failed;
-`preview stop` ends it either way. A bind ends it when the manifest sets `preview.forbidden`,
-the service is taken `down`, or its port moves; `--reset-data` keeps it and says
-in `previewNotice` that the same URL now serves new data.
+`ctx --json` reports every preview in `previews.<service>` (`url`, `state`:
+`live`, `restoring`, `failed` with the `error`, or `expired`; `expiresAt`,
+`ttlMs`, `publisher`); `previewUrls` lists the live ones. `previewExpiresAt`
+(the earliest open deadline) and `previewRestore` (the first preview that is
+not live) summarise them for scripts written for one preview. `runly ps` and
+`runly status` list every preview too. `preview stop` ends a failed or expired
+one either way. A bind ends a service's preview when the manifest sets
+`preview.forbidden` (all of them), the service is taken `down`, or its port
+moves; `--reset-data` keeps them and says in `previewNotice` that the same URL
+now serves new data.
 
 | Publisher | Address | Needs |
 | --- | --- | --- |
@@ -136,8 +145,11 @@ in `previewNotice` that the same URL now serves new data.
 
 Leave `preview.prefix` and `preview.https_port` unset unless one environment of
 the stack publishes at a time: the defaults derive from the environment id, so
-they are unique. To pin a tailnet port for one publish, use `runly preview web
---https-port 20601`. `tailscale serve` runs in the foreground as a child of the
+they are unique, and each service of the environment gets its own tailnet port.
+To pin a tailnet port for one publish, use `runly preview web
+--https-port 20601`. A pinned port belongs to one service of the lease: a
+manifest `preview.https_port` therefore serves one service, and the next one
+needs its own `--https-port` (publishing it on the same port is a work-error). `tailscale serve` runs in the foreground as a child of the
 lease, so nothing remains in tailscale's config when it ends.
 
 ## Measure and tune a setup

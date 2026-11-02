@@ -1,7 +1,7 @@
 # Decision log
 
 This is design history, not an operating guide. Start with the [current guide](../overview.md).
-Current lifecycle, preview, manifest and monitoring contracts are in **0046–0049**; the mongodb/elasticsearch drivers, derived datastores and external upkeep triggers in **0050**; the concurrent service start in **0051**.
+Current lifecycle, preview, manifest and monitoring contracts are in **0046–0049**; the mongodb/elasticsearch drivers, derived datastores and external upkeep triggers in **0050**; the concurrent service start in **0051**; previews per service in **0052**.
 
 Decisions, MADR-lite, append-only. To change a decision, add a new one that amends
 or supersedes it, point the old one's `Status:` line at it, and update this index —
@@ -36,11 +36,11 @@ each one; the decision's own `Status:` line says how.
 | [0024](0024-updating-the-running-daemon.md) | `backlot update` reconciles the running daemon to the installed build — version skew is refused, and backlot never installs itself | MCP remarks superseded by 0029 |
 | [0025](0025-data-only-environments-are-priced-separately.md) | A data-only environment answers to its own ceiling, and changing an environment's shape is a metered capacity event | Superseded by 0034 |
 | [0026](0026-a-stack-may-advertise-several-logins.md) | A stack may advertise several logins — `ctx.logins` stays the primary, `allLogins` carries the set | Accepted |
-| [0027](0027-lease-scoped-public-preview.md) | Lease-scoped public preview is explicit, supervised, and separate from `expose` | Amended by 0045; see 0047 |
+| [0027](0027-lease-scoped-public-preview.md) | Lease-scoped public preview is explicit, supervised, and separate from `expose` | Amended by 0045; see 0047; one preview per lease superseded by 0052 |
 | [0028](0028-named-preview-hostnames.md) | A preview may publish under a hostname we own, and the publisher is where that lives | Accepted |
 | [0029](0029-cli-only-agent-interface.md) | Agents use the CLI; remove the MCP adapter | Accepted |
 | [0030](0030-rename-backlot-to-runly.md) | Rename Backlot to Runly while preserving existing state, namespaces and the CLI alias | Amended by 0042 |
-| [0031](0031-tailscale-preview-publisher.md) | A preview may publish on the tailnet, through a foreground `tailscale serve` | Amended by 0033 |
+| [0031](0031-tailscale-preview-publisher.md) | A preview may publish on the tailnet, through a foreground `tailscale serve` | Amended by 0033, 0052 |
 | [0032](0032-environments-run-in-the-callers-worktree.md) | Environments run in the caller's worktree, one per worktree; `up` is the only bind verb and restarts only services whose build output changed; runly runs no checks (`ctx --env` instead of `run`/`job`/`checks:`); no per-stack ceiling; runly caches no builds; `runly warm` prepares an idle worktree | Amended by 0034, 0036–0040, 0046, 0048, 0050 |
 | [0033](0033-the-daemon-holds-public-ports-behind-an-l4-proxy.md) | The daemon holds every public port behind an L4 proxy for the environment's life; services listen on a fresh internal port; connections are held while a service starts and client bytes are counted; ports come from three disjoint blocks (public 20000–29999, internal 30000–31999, tunnel 32000–32767) below the ephemeral range | Amended by 0035, 0046, 0047, 0049 |
 | [0034](0034-additive-up-database-copies-and-ps.md) | `up` is additive and `down` stops what it names; a `--preset` reloads one datastore and restarts its users, no preset keeps the data, `ctx` reports each datastore's preset; `--data-only` is removed — a database alone is a `runly db new\|with` copy, reaped like an environment (holder or worktree gone), no TTL; `runly ps` shows services and copies | Amended by 0035, 0039, 0042, 0050; see 0046 |
@@ -54,10 +54,11 @@ each one; the decision's own `Status:` line says how.
 | [0042](0042-retire-the-pre-016-migrations.md) | The pre-0.16 migrations are removed; a journal below schema 4 is refused | Accepted |
 | [0043](0043-the-daemon-units-environment.md) | The daemon unit carries an allowlisted environment (`--env NAME`), says what it left out, and a missing tool reads as an env-error with a hint | Accepted |
 | [0044](0044-content-keyed-templates-are-shared-across-worktrees.md) | A content-keyed template (an `@rebake-template` key) is shared by every worktree of the same stack name (`<name>@shared/`, bake single-flight, `share_templates: false` opts out); `--pristine` bakes a private one; retention keeps what any live worktree last restored from; per-worktree templates with the same key are adopted | Accepted |
-| [0045](0045-a-daemon-restart-re-publishes-the-leases-previews.md) | A daemon restart re-publishes each lease's preview (same publisher, pinned address, same public port) from `leases.preview_restore`; failures are events and `ctx.previewRestore` | Restoration deadlines amended by 0047 |
+| [0045](0045-a-daemon-restart-re-publishes-the-leases-previews.md) | A daemon restart re-publishes each lease's preview (same publisher, pinned address, same public port) from `leases.preview_restore`; failures are events and `ctx.previewRestore` | Restoration deadlines amended by 0047; per service by 0052 |
 | [0046](0046-worktree-owned-activity-lifecycle.md) | Worktree ownership, five-minute activity idle, retained data; no agent-death or TTL deletion | Accepted |
-| [0047](0047-public-preview-deadlines.md) | Mandatory public-preview deadlines, expiry gate, renewal and reopening | Accepted |
+| [0047](0047-public-preview-deadlines.md) | Mandatory public-preview deadlines, expiry gate, renewal and reopening | Amended by 0052 (per service) |
 | [0048](0048-manifest-names-and-skills.md) | runly.yml/runly.yaml discovery and separate operation/setup skills | Accepted |
 | [0049](0049-local-statistics-and-monitor.md) | Bounded local statistics and read-only monitoring | Accepted |
 | [0050](0050-mongodb-elasticsearch-derived-datastores.md) | `mongodb` and `elasticsearch` command drivers with lowercase, hash-disambiguated namespaces; Elasticsearch is ephemeral derived state, flushed with its `derived_from` source; `{{datastores.<ds>.preset}}`, `{{env.id}}`, `{{env.slug}}`; upkeep `when:` may reach outside the worktree (`{{main_worktree}}`, bounded walk) | Accepted |
 | [0051](0051-services-start-concurrently-by-depends-on.md) | Services start concurrently, each as soon as its own `depends_on` are ready; a failed start (allocation, templating, spawn or readiness) stops the call's other starts at once (`stop-all` in a bind, `stop-these` in a wake); `{{…}}` in run/build/env/auth.token is checked at load | Accepted |
+| [0052](0052-previews-are-per-service.md) | A lease has one preview per service: `preview <service>` adds or renews that one, `preview stop [<service>]` stops one or all; deadlines, reopening and restart restore per service; two services never pin the same address; journal schema 6 (`lease_previews`); `ctx.previews` | Accepted |
