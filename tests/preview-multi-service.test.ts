@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { alive, ctx, goneWithin, runPreviewCleanups } from './support/preview-fixture.js';
 import { sleep } from './support/context.js';
 import { scanTagged } from '../src/core/procscan.js';
+import { formatDeadline } from '../src/core/units.js';
 
 afterEach(runPreviewCleanups);
 
@@ -98,6 +99,31 @@ describe('multi-service previews (cloudflare quick)', () => {
     const summary = await cli(['ctx']);
     expect(summary.stdout).toContain(`(preview ${web.json?.url})`);
     expect(summary.stdout).toContain(`(preview ${api.json?.url})`);
+  }, 60_000);
+
+  it('ps and status print a deadline on another day with its date, today\'s as a time', async () => {
+    const { cli } = ctx(PER_PID);
+    expect((await cli(['up', '--json'])).code).toBe(0);
+    // Three days out: a bare time of day would read as "later today".
+    const web = await cli(['preview', 'web', '--ttl', String(3 * 24 * 60), '--json']);
+    expect(web.code, web.stderr).toBe(0);
+    const api = await cli(['preview', 'api', '--json']);
+    expect(api.code, api.stderr).toBe(0);
+    const views = ((await cli(['status', '--json'])).json?.envs as Array<{ previews: Record<string, View> }>)[0]!.previews;
+    const webAt = views.web!.expiresAt!;
+    const apiAt = views.api!.expiresAt!;
+    const webWords = formatDeadline(webAt);
+    expect(webWords).not.toBe(new Date(webAt).toLocaleTimeString());
+    expect(webWords.endsWith(new Date(webAt).toLocaleTimeString())).toBe(true);
+
+    for (const verb of ['ps', 'status']) {
+      const plain = await cli([verb]);
+      expect(plain.code, plain.stderr).toBe(0);
+      expect(plain.stdout).toContain(`preview web: ${web.json?.url} (until ${webWords})`);
+      expect(plain.stdout).toContain(`preview api: ${api.json?.url} (until ${formatDeadline(apiAt)})`);
+    }
+    // JSON keeps the epoch milliseconds.
+    expect(typeof webAt).toBe('number');
   }, 60_000);
 
   it('preview stop <service> stops that one; preview stop stops all of them', async () => {

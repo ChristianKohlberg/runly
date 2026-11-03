@@ -18,7 +18,7 @@ import { BrokerError } from '../core/util.js';
 import { parseSince, showLogs, type LogsSpec } from './logs.js';
 import { monitorStats, statsLines, type StatsData } from './metrics.js';
 import { autoTether } from './tether.js';
-import { formatDuration, formatSize, parseDuration } from '../core/units.js';
+import { formatDeadline, formatDuration, formatSize, parseDuration } from '../core/units.js';
 import { exportLines, shellValue } from '../core/env-vars.js';
 
 const USAGE = `runly — puts a working instance of a web application in front of you.
@@ -1151,7 +1151,7 @@ interface PreviewView { url: string | null; state: string; error?: string; expir
 
 /** A preview in a few words: its URL and until when, or why it is not live. */
 function previewWords(p: PreviewView): string {
-  const at = p.expiresAt === null ? '' : new Date(p.expiresAt).toLocaleTimeString();
+  const at = p.expiresAt === null ? '' : formatDeadline(p.expiresAt);
   if (p.state === 'live') return `${p.url ?? ''}${at ? ` (until ${at})` : ''}`;
   if (p.state === 'expired') return `${p.url ?? ''} (expired${at ? ` at ${at}` : ''}; the next successful up reopens it)`;
   return `${p.url ?? ''} (${p.state}${p.error ? `: ${p.error}` : ''})`;
@@ -1569,7 +1569,7 @@ function ctxSummary(c: CtxView, verb: 'up' | 'ctx'): string[] {
     ? ' — no lease'
     : c.lease.expiresAt === null
       ? ' — worktree lease (no expiry)'
-      : ` — lease until ${new Date(c.lease.expiresAt).toLocaleTimeString()}`;
+      : ` — lease until ${formatDeadline(c.lease.expiresAt)}`;
   const d = c.bindDiagnostics;
   const how = verb === 'up' && d
     ? ` (${d.reuse === 'rebound' || !d.reuse ? 'bound' : d.reuse}${d.durationMs !== undefined ? ` in ${formatDuration(d.durationMs)}` : ''}${d.started?.length ? `; started ${d.started.join(', ')}` : ''}${d.restarted?.length ? `; restarted ${d.restarted.join(', ')}` : ''})`

@@ -58,3 +58,25 @@ export function formatDuration(ms: number): string {
   if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
   return `${(ms / 3_600_000).toFixed(1)}h`;
 }
+
+/**
+ * An absolute deadline for humans, in the caller's locale: the time of day
+ * when it falls on the local `now`'s calendar day, else the date too (`Mon,
+ * Nov 9, 9:20:03 PM` — the year only when it is not this year). A preview can
+ * run for days, so a bare time of day would read as "later today". JSON keeps
+ * the epoch milliseconds; this is only for plain output.
+ */
+export function formatDeadline(at: number, now: number = Date.now()): string {
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return String(at);
+  const n = new Date(now);
+  const time = d.toLocaleTimeString();
+  if (d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate()) return time;
+  const date = d.toLocaleDateString(undefined, {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+    ...(d.getFullYear() === n.getFullYear() ? {} : { year: 'numeric' as const }),
+  });
+  return `${date}, ${time}`;
+}
