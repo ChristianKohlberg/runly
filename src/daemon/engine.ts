@@ -6,7 +6,7 @@ import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync } from 'node:f
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, NO_LEASE_EXPIRY, type DbCopyRow, type DropRecipe, type EnvRow, type LeasePreview, type LeaseRow, type PreviewRestore } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { CASE_FOLDING_DRIVERS, buildOf, canonicalDirectory, defaultPreset, derivedDatastores, findStackRoot, envDatastoreNames, type DatastoreSpec, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
+import { CASE_FOLDING_DRIVERS, buildOf, canonicalDirectory, defaultPreset, derivedDatastores, publicUrlReferences, findStackRoot, envDatastoreNames, type DatastoreSpec, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
 import { forgetNamespace, recordedNamespaces } from '../core/namespaces.js';
 import { envSlug, runlyEnvVars } from '../core/env-vars.js';
@@ -964,9 +964,20 @@ export class Engine {
    * for a service that has to advertise its own address.
    */
   private templateCtx(stack: Stack, env: EnvRow, own?: { key: string; port: number }, upcoming: Record<string, string> = {}) {
-    const services: Record<string, { url: string }> = {};
+    const services: Record<string, { url: string; public_url?: string }> = {};
     for (const [name, spec] of Object.entries(stack.manifest.services)) {
-      if (spec.port) services[name] = { url: `http://localhost:${env.ports[spec.port]}` };
+      if (!spec.port) continue;
+      const url = `http://localhost:${env.ports[spec.port]}`;
+      const entry: { url: string; public_url?: string } = { url };
+      // Lazy and non-enumerable (decision 0053): resolving it may ask the
+      // publisher's CLI, so only a template that names it pays for that, and
+      // nothing that spreads or serialises the context triggers it.
+      let resolved: string | undefined;
+      Object.defineProperty(entry, 'public_url', {
+        enumerable: false,
+        get: () => (resolved ??= this.publicUrl(stack, env, name, url)),
+      });
+      services[name] = entry;
     }
     const ports = own ? { ...env.ports, [own.key]: own.port } : env.ports;
     const datastores: Record<string, { url: string; ns: string; preset: string }> = {};
@@ -981,6 +992,28 @@ export class Engine {
     // `{{env.id}}` / `{{env.slug}}` (decision 0050): stable for the
     // environment's life; the slug is the lowercase, DNS-label-safe form.
     return { ports, public_ports: env.ports, services, datastores, env: { id: env.id, slug: envSlug(env.id) } };
+  }
+
+  /**
+   * `{{services.<svc>.public_url}}` (decision 0053): where a browser outside
+   * this machine reaches the service. The live preview's URL when there is one;
+   * else the address the stack's publisher would publish it at, when the
+   * publisher can name it in advance (with the settings a restore would reuse);
+   * else the local URL. A stack that forbids preview is never published, so it
+   * always gets the local URL. Never throws.
+   */
+  private publicUrl(stack: Stack, env: EnvRow, service: string, localUrl: string): string {
+    if (stack.manifest.preview?.forbidden) return localUrl;
+    const record = this.journal.leaseForEnv(env.id)?.previews[service];
+    if (record?.pid && record.url) return record.url;
+    try {
+      const restore = record?.restore;
+      const pub = resolvePreviewPublisher(restore?.publisher ?? this.previewPublisherName(stack));
+      const settings = (restore?.settings as PreviewSettings | undefined) ?? stack.manifest.preview;
+      return pub.address?.({ envId: env.id, service, settings }) ?? localUrl;
+    } catch {
+      return localUrl;
+    }
   }
 
   private supervisor(env: EnvRow): EnvSupervisor {
@@ -2365,6 +2398,14 @@ export class Engine {
       urls[name] = s.url;
     }
     const { previewUrls, previews, previewExpiresAt, previewRestore } = this.previewViews(lease);
+    // Only the services some template names (decision 0053): resolving a
+    // public URL may ask the publisher's CLI, and a polling agent must not pay
+    // that for a stack that never uses it.
+    const publicUrls: Record<string, string> = {};
+    for (const name of publicUrlReferences(stack.manifest)) {
+      const s = ctx.services[name];
+      if (s && !(activeSet && !activeSet.has(name))) publicUrls[name] = s.public_url ?? s.url;
+    }
     return {
       stack: stack.manifest.name,
       envId: env.id,
@@ -2380,6 +2421,12 @@ export class Engine {
        * own readiness probes bypass it and are never counted.
        */
       proxy: this.proxy.stats(env.id),
+      /**
+       * What `{{services.<svc>.public_url}}` resolves to now, for each service
+       * a template names (decision 0053). A running service holds the value it
+       * was started with.
+       */
+      publicUrls,
       /** Every live public preview of this lease, by service (decision 0052). */
       previewUrls,
       /**
