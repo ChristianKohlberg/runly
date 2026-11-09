@@ -54,6 +54,9 @@ A service's own {{ports.web}} is its internal listening port. Peers use
 {{services.web.url}} or {{ports.web}} to reach its stable public proxy.
 {{public_ports.web}} always means public. Tests must use the public URL so
 their traffic counts as activity.
+{{services.web.public_url}} is where a browser outside this machine reaches
+web (the preview's address, else localhost): use it for IdP redirect URIs and
+origin allowlists instead of hard-coding a tailnet or tunnel host.
 
 depends_on names services that must be ready first, including dependencies
 needed by readiness probes; otherwise wake can wait on an idle peer.

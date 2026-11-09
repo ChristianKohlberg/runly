@@ -83,6 +83,13 @@ certificate from `cloudflared tunnel login`, not just the binary), and
 `checkPrerequisite` names that command because "unauthorized" from a tunnel
 create is not something an operator can act on.
 
+`address()` (decision 0053) names the address a publish WOULD get, for
+`{{services.<svc>.public_url}}`; it must never publish, throw or change
+anything, and must derive exactly what `start` would (tailscale: same
+`deriveTailnetPort` inputs), or a service is started with an origin its preview
+never serves. The context property is lazy and non-enumerable so a stack that
+never names it never runs a publisher CLI — keep it that way.
+
 A wildcard record was considered and **rejected**: it binds the whole zone to
 one tunnel, which forces one shared cloudflared process for every previewed
 service — and a shared process cannot honour 0027's `stop()` contract, because

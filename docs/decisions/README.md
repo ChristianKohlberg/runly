@@ -1,7 +1,7 @@
 # Decision log
 
 This is design history, not an operating guide. Start with the [current guide](../overview.md).
-Current lifecycle, preview, manifest and monitoring contracts are in **0046–0049**; the mongodb/elasticsearch drivers, derived datastores and external upkeep triggers in **0050**; the concurrent service start in **0051**; previews per service in **0052**.
+Current lifecycle, preview, manifest and monitoring contracts are in **0046–0049**; the mongodb/elasticsearch drivers, derived datastores and external upkeep triggers in **0050**; the concurrent service start in **0051**; previews per service in **0052**; `{{services.<svc>.public_url}}` in **0053**.
 
 Decisions, MADR-lite, append-only. To change a decision, add a new one that amends
 or supersedes it, point the old one's `Status:` line at it, and update this index —
@@ -62,3 +62,4 @@ each one; the decision's own `Status:` line says how.
 | [0050](0050-mongodb-elasticsearch-derived-datastores.md) | `mongodb` and `elasticsearch` command drivers with lowercase, hash-disambiguated namespaces; Elasticsearch is ephemeral derived state, flushed with its `derived_from` source; `{{datastores.<ds>.preset}}`, `{{env.id}}`, `{{env.slug}}`; upkeep `when:` may reach outside the worktree (`{{main_worktree}}`, bounded walk) | Accepted |
 | [0051](0051-services-start-concurrently-by-depends-on.md) | Services start concurrently, each as soon as its own `depends_on` are ready; a failed start (allocation, templating, spawn or readiness) stops the call's other starts at once (`stop-all` in a bind, `stop-these` in a wake); `{{…}}` in run/build/env/auth.token is checked at load | Accepted |
 | [0052](0052-previews-are-per-service.md) | A lease has one preview per service: `preview <service>` adds or renews that one, `preview stop [<service>]` stops one or all; deadlines, reopening and restart restore per service; two services never pin the same address; journal schema 6 (`lease_previews`); `ctx.previews` | Accepted |
+| [0053](0053-a-service-can-template-its-public-url.md) | `{{services.<svc>.public_url}}`: the live preview's URL, else the publisher's address named in advance (`address()`: tailscale, cloudflare-named), else the local URL; resolved lazily at start; `ctx.publicUrls` | Accepted |
