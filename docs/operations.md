@@ -128,7 +128,8 @@ publisher and, where the publisher can pin it, the same address
 (`cloudflare-quick` gets a new name); the service wakes on the first request.
 `ctx --json` reports every preview in `previews.<service>` (`url`, `state`:
 `live`, `restoring`, `failed` with the `error`, or `expired`; `expiresAt`,
-`ttlMs`, `publisher`); `previewUrls` lists the live ones. `previewExpiresAt`
+`ttlMs`, `publisher`); `previewUrls` lists the live ones, and `publicUrls` what
+`{{services.<svc>.public_url}}` resolves to for each service a template names. `previewExpiresAt`
 (the earliest open deadline) and `previewRestore` (the first preview that is
 not live) summarise them for scripts written for one preview. `runly ps` and
 `runly status` list every preview too. `preview stop` ends a failed or expired

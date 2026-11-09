@@ -473,6 +473,7 @@ function checkTemplateVariables(manifest: Manifest, file: string): void {
     known.add(`ports.${spec.port}`);
     known.add(`public_ports.${spec.port}`);
     known.add(`services.${svc}.url`);
+    known.add(`services.${svc}.public_url`);
   }
   for (const [ds, spec] of Object.entries(manifest.datastores ?? {})) {
     if (spec.copies_only === true) continue;
@@ -495,6 +496,28 @@ function checkTemplateVariables(manifest: Manifest, file: string): void {
     for (const [k, v] of Object.entries(spec.env ?? {})) check(`service '${svc}' env ${k}`, v);
   }
   check('auth.token', manifest.auth?.token, ['role']);
+}
+
+/**
+ * The services whose `{{services.<svc>.public_url}}` some templated field
+ * (a service's run, build or env, or `auth.token`) names (decision 0053).
+ */
+export function publicUrlReferences(manifest: Manifest): string[] {
+  const named = new Set<string>();
+  const scan = (text: unknown) => {
+    if (typeof text !== 'string') return;
+    for (const m of text.matchAll(TEMPLATE_VAR)) {
+      const hit = /^services\.(.+)\.public_url$/.exec(m[1]!);
+      if (hit) named.add(hit[1]!);
+    }
+  };
+  for (const spec of Object.values(manifest.services ?? {})) {
+    scan(spec.run);
+    scan(buildOf(spec)?.run);
+    for (const v of Object.values(spec.env ?? {})) scan(v);
+  }
+  scan(manifest.auth?.token);
+  return [...named].sort();
 }
 
 /** The datastores derived from `source` (decision 0050). */

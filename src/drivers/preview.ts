@@ -68,6 +68,14 @@ export interface PreviewPublisher {
    * compares claims without knowing what they mean — the dialect stays here.
    */
   claim?(settings: PreviewSettings | undefined): string | undefined;
+  /**
+   * The address `start` WOULD publish this service at, without publishing
+   * anything (decision 0053) — what `{{services.<svc>.public_url}}` resolves to
+   * before (or without) a preview. Undefined when the publisher cannot name it
+   * in advance (`cloudflare-quick`'s hostname is random) or this machine cannot
+   * publish right now; it must never throw and never change anything.
+   */
+  address?(opts: { envId: string; service: string; settings?: PreviewSettings }): string | undefined;
 }
 
 const URL_RE = /https:\/\/[^\s]+trycloudflare\.com/;
@@ -296,6 +304,11 @@ function label(raw: string): string {
  * output (`--output json`) stays on stdout, so the two are kept apart rather
  * than concatenated.
  */
+/** The hostname `cloudflare-named` publishes a service at: `<service>-<prefix>.<domain>`. */
+function namedHostname(prefix: string, service: string, domain: string): string {
+  return `${label(`${service}-${prefix}`)}.${domain}`;
+}
+
 function cf(bin: string, args: string[], what: string): { out: string; err: string } {
   const res = spawnSync(bin, args, { encoding: 'utf8' });
   if (res.error) {
@@ -378,7 +391,7 @@ class CloudflareNamedPublisher implements PreviewPublisher {
     // see PreviewSpec.prefix for why the manifest is the wrong place to make a
     // pooled stack's hostnames distinct.
     const prefix = label(opts.settings?.prefix?.trim() || opts.envId);
-    const hostname = `${label(`${opts.service}-${prefix}`)}.${domain}`;
+    const hostname = namedHostname(prefix, opts.service, domain);
     const tunnelName = `backlot-${label(`${prefix}-${opts.service}`)}`;
 
     const bin = cloudflaredBin();
@@ -471,6 +484,13 @@ class CloudflareNamedPublisher implements PreviewPublisher {
    */
   async stop(rec: ServicePid): Promise<boolean> {
     return killGroupVerified(rec.pid, rec.startTime);
+  }
+
+  /** The hostname is a function of the settings alone, so it is known before any publish. */
+  address(opts: { envId: string; service: string; settings?: PreviewSettings }): string | undefined {
+    const domain = opts.settings?.domain?.trim();
+    if (!domain) return undefined;
+    return `https://${namedHostname(label(opts.settings?.prefix?.trim() || opts.envId), opts.service, domain)}`;
   }
 }
 
@@ -729,6 +749,24 @@ class TailscalePublisher implements PreviewPublisher {
   /** The foreground session dies with the process, and the tailnet mapping with it. */
   async stop(rec: ServicePid): Promise<boolean> {
     return killGroupVerified(rec.pid, rec.startTime);
+  }
+
+  /**
+   * The machine's tailnet name and the port a publish would take: the pinned
+   * one, or the derived one given what this machine serves right now — the
+   * same computation `start` makes, so the two agree unless someone takes that
+   * port in between (decision 0053). Undefined when tailscale cannot serve.
+   */
+  address(opts: { envId: string; service: string; settings?: PreviewSettings }): string | undefined {
+    try {
+      const bin = tailscaleBin();
+      if (!cloudflaredAvailable(bin)) return undefined;
+      const host = this.self(bin);
+      const port = opts.settings?.https_port ?? deriveTailnetPort(opts.envId, opts.service, tailnetPortsInUse(tsJson(bin, ['serve', 'status', '--json'], 'reading tailscale serve status')));
+      return `https://${host}${port === 443 ? '' : `:${port}`}`;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Each service of a lease is served on its own tailnet port (decision 0052). */
